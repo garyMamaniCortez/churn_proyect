@@ -2,8 +2,23 @@ loguru
 mkdocs
 pip
 pytest
+pytest-mock
 python-dotenv
 ruff
 tqdm
 typer
 -e .
+
+# Data extraction / versioning (Phase 1: extraction + EDA)
+sqlalchemy>=2.0
+psycopg2-binary
+pandas
+pydantic>=2.0
+pydantic-settings
+dvc
+
+# Added in later phases as we build them:
+# scikit-learn, matplotlib, seaborn   -> segmentation / EDA
+# mlflow                               -> experiment tracking
+# fastapi, uvicorn                     -> model serving
+
