@@ -1,0 +1,5 @@
+outs:
+- md5: 82534a1bf99f44859fc60ab3b0b501c8
+  size: 3783
+  hash: md5
+  path: pagos_pendientes.csv

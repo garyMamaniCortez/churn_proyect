@@ -1,0 +1,5 @@
+outs:
+- md5: 3e3c1e1786e5e73725e9371292896752
+  size: 638664
+  hash: md5
+  path: ventas_servicios.csv

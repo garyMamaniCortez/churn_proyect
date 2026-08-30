@@ -1,0 +1,11 @@
+{
+  "extracted_at_utc": "2026-08-30T19:28:41.396062+00:00",
+  "row_counts": {
+    "personas": 4435,
+    "inscripciones": 10442,
+    "servicios": 29,
+    "registros_acceso": 66040,
+    "ventas_servicios": 10406,
+    "pagos_pendientes": 41
+  }
+}

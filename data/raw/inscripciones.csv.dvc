@@ -1,0 +1,5 @@
+outs:
+- md5: d98e61774e501775d4de699802282589
+  size: 432490
+  hash: md5
+  path: inscripciones.csv

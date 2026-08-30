@@ -1,0 +1,5 @@
+outs:
+- md5: 58c4d8b540f5382b20da85ad630ed286
+  size: 3493073
+  hash: md5
+  path: registros_acceso.csv

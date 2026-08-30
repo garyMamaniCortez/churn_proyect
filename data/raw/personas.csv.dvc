@@ -1,0 +1,5 @@
+outs:
+- md5: 46498ae3c6a378325d1b6403148471c6
+  size: 54074
+  hash: md5
+  path: personas.csv
