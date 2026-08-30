@@ -1,5 +1,8 @@
 # Data
-/data/
+# NOTE: not blanket-ignoring /data/ anymore — DVC manages ignore rules per file
+# (it appends to this .gitignore automatically the first time you `dvc add` a path,
+# e.g. data/raw/personas.csv). The corresponding data/raw/*.dvc pointer files ARE
+# meant to be committed to git.
 
 # Mac OS-specific storage files
 .DS_Store
