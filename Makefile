@@ -61,10 +61,17 @@ create_environment:
 #################################################################################
 
 
-## Make dataset
-.PHONY: data
-data: requirements
-	$(PYTHON_INTERPRETER) churn_detection/dataset.py
+## Extract raw client data from Postgres into data/raw/ (requires a working .env)
+.PHONY: extract-data
+extract-data: requirements
+	$(PYTHON_INTERPRETER) -m churn_detection.dataset extract-all
+
+## Version the freshly extracted raw data with DVC
+.PHONY: version-data
+version-data:
+	dvc add data/raw/personas.csv data/raw/inscripciones.csv data/raw/servicios.csv \
+		data/raw/registros_acceso.csv data/raw/ventas_servicios.csv data/raw/pagos_pendientes.csv
+	@echo ">>> Now git add the resulting data/raw/*.dvc files and commit."
 
 
 #################################################################################
