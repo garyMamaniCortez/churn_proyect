@@ -1,0 +1,74 @@
+schema: '2.0'
+stages:
+  build_features:
+    cmd: python -m churn_detection.features
+    deps:
+    - path: churn_detection/config.py
+      hash: md5
+      md5: 0336282499be05909b4207f3ce778523
+      size: 3343
+    - path: churn_detection/features.py
+      hash: md5
+      md5: e5e7d7690a14392b6d7e21b2b5d09d4e
+      size: 15569
+    - path: data/raw/inscripciones.csv
+      hash: md5
+      md5: d98e61774e501775d4de699802282589
+      size: 432490
+    - path: data/raw/pagos_pendientes.csv
+      hash: md5
+      md5: 82534a1bf99f44859fc60ab3b0b501c8
+      size: 3783
+    - path: data/raw/personas.csv
+      hash: md5
+      md5: 46498ae3c6a378325d1b6403148471c6
+      size: 54074
+    - path: data/raw/registros_acceso.csv
+      hash: md5
+      md5: 58c4d8b540f5382b20da85ad630ed286
+      size: 3493073
+    - path: data/raw/servicios.csv
+      hash: md5
+      md5: 8bbb7e6ce0641fbf57a7f688712405da
+      size: 1410
+    - path: data/raw/ventas_servicios.csv
+      hash: md5
+      md5: 3e3c1e1786e5e73725e9371292896752
+      size: 638664
+    outs:
+    - path: data/processed/clientes_segmentacion.csv
+      hash: md5
+      md5: a9c18eb44025b1c0bdf0486987837729
+      size: 545434
+  eda:
+    cmd: python -m churn_detection.plots
+    deps:
+    - path: churn_detection/plots.py
+      hash: md5
+      md5: 2105b88ce15a2d7ce41251fce2c0dc73
+      size: 7791
+    - path: data/processed/clientes_segmentacion.csv
+      hash: md5
+      md5: a9c18eb44025b1c0bdf0486987837729
+      size: 545434
+    outs:
+    - path: reports/figures/01_missingness.png
+      hash: md5
+      md5: 18b9d80a65af619c85cfa4d3303467bd
+      size: 69825
+    - path: reports/figures/02_distribuciones_numericas.png
+      hash: md5
+      md5: d050cd13999cd5109cba2ba3d6807d3e
+      size: 121489
+    - path: reports/figures/03_correlacion.png
+      hash: md5
+      md5: 4cd363417a4e535e581e5d98ed60d4ff
+      size: 247612
+    - path: reports/figures/04_categoricas.png
+      hash: md5
+      md5: aa80f55fdc06ecc5165becc074751578
+      size: 91496
+    - path: reports/figures/05_uso_vs_recencia.png
+      hash: md5
+      md5: 873c89c9d8687e0ed680c40f2c28ee7b
+      size: 393374

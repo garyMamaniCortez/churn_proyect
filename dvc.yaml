@@ -1,0 +1,26 @@
+stages:
+  build_features:
+    cmd: python -m churn_detection.features
+    deps:
+      - churn_detection/features.py
+      - churn_detection/config.py
+      - data/raw/personas.csv
+      - data/raw/inscripciones.csv
+      - data/raw/servicios.csv
+      - data/raw/registros_acceso.csv
+      - data/raw/ventas_servicios.csv
+      - data/raw/pagos_pendientes.csv
+    outs:
+      - data/processed/clientes_segmentacion.csv
+
+  eda:
+    cmd: python -m churn_detection.plots
+    deps:
+      - churn_detection/plots.py
+      - data/processed/clientes_segmentacion.csv
+    outs:
+      - reports/figures/01_missingness.png
+      - reports/figures/02_distribuciones_numericas.png
+      - reports/figures/03_correlacion.png
+      - reports/figures/04_categoricas.png
+      - reports/figures/05_uso_vs_recencia.png
