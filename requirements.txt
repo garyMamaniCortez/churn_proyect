@@ -18,7 +18,9 @@ pydantic-settings
 dvc
 
 # Added in later phases as we build them:
-# scikit-learn, matplotlib, seaborn   -> segmentation / EDA
+scikit-learn
+matplotlib
+seaborn
 # mlflow                               -> experiment tracking
 # fastapi, uvicorn                     -> model serving
 

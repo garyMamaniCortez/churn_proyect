@@ -78,6 +78,10 @@ version-data:
 		data/raw/registros_acceso.csv data/raw/ventas_servicios.csv data/raw/pagos_pendientes.csv
 	@echo ">>> Now git add the resulting data/raw/*.dvc files and commit."
 
+## run EDA analisis
+.PHONY: eda-analisis
+eda-analisis:
+	$(PYTHON_INTERPRETER) -m churn_detection.plots
 
 #################################################################################
 # Self Documenting Commands                                                     #
