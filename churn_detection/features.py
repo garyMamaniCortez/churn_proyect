@@ -99,7 +99,6 @@ class ClientSegmentationTableBuilder:
             "n_checkins_total",
             "n_checkins_ultimos_30d",
             "n_checkins_ultimos_90d",
-            "n_ventas",
         ]
         master[count_cols] = master[count_cols].fillna(0).astype(int)
         master["es_multisucursal"] = master["n_sucursales_distintas"] > 1
@@ -284,8 +283,11 @@ class ClientSegmentationTableBuilder:
 
     @staticmethod
     def _build_monetary_features(ventas_servicios: pd.DataFrame) -> pd.DataFrame:
+        # n_ventas deliberately NOT included: EDA showed it correlates 0.99 with
+        # n_inscripciones_total (each service sale maps almost 1:1 to an
+        # inscripcion), so keeping both would double-weight the same signal in
+        # clustering. n_inscripciones_total is already in the lifecycle features.
         out = ventas_servicios.groupby("persona_id").agg(
-            n_ventas=("venta_servicio_id", "count"),
             monto_total_gastado=("total", "sum"),
             monto_promedio_venta=("total", "mean"),
         )
