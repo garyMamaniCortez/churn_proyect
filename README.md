@@ -82,6 +82,66 @@ sistema no lo registró". Se agregó `config.RELIABLE_ACCESS_TRACKING_SINCE =
 fecha. El % de nulos en esas columnas subió como consecuencia (ver arriba) —
 es más honestidad sobre lo que no sabemos, no menos información real.
 
+**Corrección adicional:** el EDA mostró que `n_ventas` correlaciona 0.99 con
+`n_inscripciones_total` (cada venta de servicio corresponde casi 1 a 1 con una
+inscripción), así que se sacó de la tabla para no duplicar el peso de esa señal
+en el clustering. `n_inscripciones_total` ya la representa.
+
+## Pipeline de DVC (datos, features y EDA)
+
+En vez de versionar archivos sueltos con `dvc add`, el proyecto usa un
+pipeline declarado en `dvc.yaml` con dos etapas:
+
+- **`build_features`**: corre `python -m churn_detection.features`, depende
+  del código (`features.py`, `config.py`) y de los 6 CSV crudos, y produce
+  `data/processed/clientes_segmentacion.csv`.
+- **`eda`**: corre `python -m churn_detection.plots`, depende de `plots.py` y
+  del CSV de segmentación, y produce las 5 figuras en `reports/figures/`.
+
+Esto significa que las figuras quedan atadas por hash tanto al dataset como al
+código que las generó: si cambia cualquiera de los dos, `dvc status` lo va a
+marcar como desactualizado.
+
+```powershell
+dvc repro
+```
+
+Regenera solo lo que cambió (o todo, la primera vez) y actualiza `dvc.lock`.
+Después, para versionar:
+
+```powershell
+git add dvc.yaml dvc.lock data/processed/.gitignore reports/figures/.gitignore
+git commit -m "data: pipeline de segmentacion + eda"
+dvc push   # requiere tener un remote configurado (ver mas abajo)
+```
+
+Los datos crudos (`data/raw/*.csv`) siguen versionados aparte con `dvc add`
+como en la fase anterior, y el pipeline los referencia como dependencias de
+solo lectura.
+
+## Hallazgos del EDA (2026-09-01, 4,434 clientes)
+
+- **`n_inscripciones_total` y `n_ventas` correlacionaban 0.99** entre sí, señal
+  de que eran casi la misma variable; se sacó `n_ventas` de la tabla (ver más
+  arriba).
+- **`recencia_dias` y `monto_total_gastado` están fuertemente sesgados a la
+  derecha**: la mayoría de los clientes están concentrados en valores bajos
+  (visitaron hace poco, gastan poco) con una cola larga de pocos clientes con
+  valores altos. Esto es relevante para la etapa de clustering: probablemente
+  convenga escalar o transformar (por ejemplo log) estas variables antes de
+  correr K-Means, que es sensible a la escala y a los outliers.
+- **`es_multisucursal` y `tiene_pago_pendiente` tienen varianza casi nula**
+  (menos del 4% y menos del 1% de los clientes en `True`, respectivamente).
+  Aportan poco como variable de clustering tal cual están; podrían mantenerse
+  como atributo descriptivo de cada segmento en vez de como input del modelo.
+- **La asistencia está fuertemente concentrada de lunes a viernes**, con muy
+  poca actividad los sábados y prácticamente nula los domingos, consistente
+  con el horario de atención del gimnasio.
+- El dispersograma de `porcentaje_uso_membresia` vs. `recencia_dias` muestra
+  una relación negativa razonable, más días sin venir tienden a asociarse con
+  menor uso de la membresía, pero con dispersión suficiente como para esperar
+  más de un segmento dentro de cada nivel de recencia.
+
 ## Cómo construir el dataset de segmentación (después de extraer los datos)
 
 ```powershell
@@ -153,7 +213,9 @@ git commit -m "data: dataset de segmentacion de clientes"
     │   ├── predict.py          <- Code to run model inference with trained models          
     │   └── train.py            <- Code to train models
     │
-    └── plots.py                <- Code to create visualizations
+    └── plots.py                <- EDAFigureGenerator: builds reports/figures/*.png
+                                    (nulos, distribuciones, correlación, categóricas,
+                                    uso vs. recencia) from data/processed/clientes_segmentacion.csv
 ```
 
 ## Stack (según lo definido)
