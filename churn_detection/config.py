@@ -2,6 +2,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from loguru import logger
+import pandas as pd
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -55,6 +56,25 @@ class ChurnSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=str(PROJ_ROOT / ".env"), extra="ignore")
 
     churn_grace_days: int = Field(default=30, ge=0)
+
+
+# Known bad/non-representative persona_id values to exclude from client-level
+# analysis (segmentation + churn). Found during EDA on 2026-08-30:
+#   32 -> generic front-desk "walk-in / day-pass" account: 1,857 inscripciones /
+#         1,857 ventas but only 42 check-ins (2% ratio, next-highest client in the
+#         whole dataset has 11 inscripciones). fecha_nacimiento is 2016-02-29,
+#         which would make this "person" ~10 years old — clearly not a real member.
+# Revisit this list whenever new raw data is extracted; do not assume it's exhaustive.
+EXCLUDED_PERSONA_IDS: frozenset[int] = frozenset({32})
+
+# The check-in/access-logging module (registros_acceso, and the ingresos_disponibles
+# decrement it drives on inscripciones) did not work reliably before this date --
+# confirmed by the client and by the data: Oct-2025..Jan-2026 has near-zero access
+# records (Jan-2026 has 5 rows total) and inscripciones started in that window show
+# 61% "never used" vs 10% from Feb-2026 onward. Any check-in/usage feature built
+# from data before this date measures the outage, not the customer. Treat it as
+# unreliable -> NaN, never as "0 visits" / "0% usage".
+RELIABLE_ACCESS_TRACKING_SINCE = pd.Timestamp("2026-02-01")
 
 
 # If tqdm is installed, configure loguru with tqdm.write

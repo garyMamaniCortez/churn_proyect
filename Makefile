@@ -66,6 +66,11 @@ create_environment:
 extract-data: requirements
 	$(PYTHON_INTERPRETER) -m churn_detection.dataset extract-all
 
+## Build the client segmentation table from data/raw/ -> data/processed/clientes_segmentacion.csv
+.PHONY: build-features
+build-features: requirements
+	$(PYTHON_INTERPRETER) -m churn_detection.features
+
 ## Version the freshly extracted raw data with DVC
 .PHONY: version-data
 version-data:
