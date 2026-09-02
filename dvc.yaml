@@ -24,3 +24,14 @@ stages:
       - reports/figures/03_correlacion.png
       - reports/figures/04_categoricas.png
       - reports/figures/05_uso_vs_recencia.png
+
+  segmentation:
+    cmd: python -m churn_detection.modeling.segmentation
+    deps:
+      - churn_detection/modeling/segmentation.py
+      - data/processed/clientes_segmentacion.csv
+    outs:
+      - data/processed/clientes_segmentados.csv
+      - data/processed/perfil_clusters.csv
+      - data/processed/comparacion_algoritmos.csv
+      - reports/figures/06_seleccion_k.png
