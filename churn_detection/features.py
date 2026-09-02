@@ -38,6 +38,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
 
 from churn_detection.config import RELIABLE_ACCESS_TRACKING_SINCE
@@ -103,19 +104,19 @@ class ClientSegmentationTableBuilder:
         master[count_cols] = master[count_cols].fillna(0).astype(int)
         master["es_multisucursal"] = master["n_sucursales_distintas"] > 1
 
-        money_cols = ["monto_total_gastado", "monto_promedio_venta"]
+        money_cols = ["monto_total_gastado", "monto_promedio_venta", "monto_gastado_ultimos_90d"]
         master[money_cols] = master[money_cols].fillna(0.0)
 
         master["tiene_pago_pendiente"] = master["tiene_pago_pendiente"].fillna(False)
 
         # Left as NaN (NOT imputed here) when undefined for a client, e.g.
         # `hora_promedio_checkin` for someone with no check-ins in the reliable
-        # window, or `porcentaje_uso_membresia` for someone with no membership-type
-        # inscripcion that started on/after RELIABLE_ACCESS_TRACKING_SINCE. Both are
-        # under the 40% missingness threshold (17.5% and 10.9% respectively as of
-        # the 2026-08-30 extraction) so the columns stay; how to handle the
-        # remaining NaNs (impute vs. flag vs. drop those rows) is a modeling-stage
-        # decision, not a feature-engineering one.
+        # window, `porcentaje_uso_membresia` for someone with no membership-type
+        # inscripcion since RELIABLE_ACCESS_TRACKING_SINCE, `cv_gap_visitas` for
+        # someone with fewer than 3 check-ins, or `ratio_actividad_reciente` for
+        # someone with zero historical weekly frequency to compare against. How
+        # to handle the remaining NaNs (impute vs. flag vs. drop those rows) is a
+        # modeling-stage decision, not a feature-engineering one.
         return master
 
     # -- private helpers -------------------------------------------------
@@ -211,6 +212,8 @@ class ClientSegmentationTableBuilder:
             "hora_checkin_std",
             "pct_visitas_fin_de_semana",
             "dia_semana_mas_frecuente",
+            "ratio_actividad_reciente",
+            "cv_gap_visitas",
         ]
         if reg.empty:
             # groupby/agg on an empty frame can't infer real dtypes (e.g. a
@@ -260,6 +263,24 @@ class ClientSegmentationTableBuilder:
             .rename("_visit_span_dias")
         )
 
+        # Coefficient of variation of the gaps between consecutive successful
+        # check-ins: how CONSISTENT is a client's attendance rhythm, as opposed
+        # to how often they come. Two clients can have the same average
+        # frequency but one shows up every 3 days like clockwork (low CV) while
+        # the other comes in unpredictable bursts (high CV) -- that distinction
+        # is invisible to every feature built so far. Needs >=3 check-ins (2
+        # gaps) to be meaningful; fewer than that -> NaN, not 0.
+        def _cv_gaps(dates: pd.Series) -> float:
+            if len(dates) < 3:
+                return np.nan
+            gaps = dates.sort_values().diff().dt.days.dropna()
+            mean_gap = gaps.mean()
+            if mean_gap == 0:
+                return np.nan
+            return gaps.std() / mean_gap
+
+        cv_gap_visitas = reg.groupby("persona_id")["fecha"].agg(_cv_gaps).rename("cv_gap_visitas")
+
         out = pd.concat(
             [
                 total,
@@ -271,26 +292,59 @@ class ClientSegmentationTableBuilder:
                 pct_finde,
                 dia_frecuente,
                 visit_span_days,
+                cv_gap_visitas,
             ],
             axis=1,
         ).reset_index()
         out = out.rename(columns={"index": "persona_id"})
 
+        # A client with a check-in in the reliable window but NONE in the last
+        # 30/90 days is absent from the `last_30`/`last_90` groupby entirely
+        # (not present with a 0), so the concat above leaves NaN, not 0, for
+        # them. Fix that here, before it's used in `ratio_actividad_reciente`
+        # below -- the outer `build()` fillna(0) runs too late for that.
+        out[["n_checkins_ultimos_30d", "n_checkins_ultimos_90d"]] = out[
+            ["n_checkins_ultimos_30d", "n_checkins_ultimos_90d"]
+        ].fillna(0)
+
         out["recencia_dias"] = (cfg.snapshot_date - out["ultimo_checkin"]).dt.days
         out["frecuencia_visitas_semanal"] = out["n_checkins_total"] / (out["_visit_span_dias"] / 7)
 
+        # Momentum: are the last 30 days busier or quieter than this client's own
+        # historical weekly pace would predict? >1 = accelerating, <1 =
+        # decelerating, ~1 = steady. This is the "direction" signal that the
+        # level-only features (frequency, recency) can't capture on their own --
+        # two clients at the same frequency today can be heading opposite ways.
+        expected_checkins_30d = out["frecuencia_visitas_semanal"] * (30 / 7)
+        out["ratio_actividad_reciente"] = out[
+            "n_checkins_ultimos_30d"
+        ] / expected_checkins_30d.replace(0, np.nan)
+
         return out[expected_cols]
 
-    @staticmethod
-    def _build_monetary_features(ventas_servicios: pd.DataFrame) -> pd.DataFrame:
+    def _build_monetary_features(self, ventas_servicios: pd.DataFrame) -> pd.DataFrame:
         # n_ventas deliberately NOT included: EDA showed it correlates 0.99 with
         # n_inscripciones_total (each service sale maps almost 1:1 to an
         # inscripcion), so keeping both would double-weight the same signal in
         # clustering. n_inscripciones_total is already in the lifecycle features.
-        out = ventas_servicios.groupby("persona_id").agg(
+        ventas = ventas_servicios.copy()
+        ventas["fecha"] = pd.to_datetime(ventas["fecha"])
+
+        out = ventas.groupby("persona_id").agg(
             monto_total_gastado=("total", "sum"),
             monto_promedio_venta=("total", "mean"),
         )
+
+        # Recent spend (not subject to the check-in tracking outage -- ventas
+        # come from the point-of-sale flow, not the access-log module -- so the
+        # full history is usable here, no RELIABLE_ACCESS_TRACKING_SINCE cutoff).
+        last_90 = ventas[ventas["fecha"] >= self._config.snapshot_date - pd.Timedelta(days=90)]
+        monto_90d = (
+            last_90.groupby("persona_id")["total"].sum().rename("monto_gastado_ultimos_90d")
+        )
+        out = out.join(monto_90d, how="left")
+        out["monto_gastado_ultimos_90d"] = out["monto_gastado_ultimos_90d"].fillna(0.0)
+
         return out.reset_index()
 
     @staticmethod

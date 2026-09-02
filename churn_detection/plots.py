@@ -34,6 +34,9 @@ NUMERIC_FEATURES_FOR_DISTRIBUTION = [
     "frecuencia_visitas_semanal",
     "hora_promedio_checkin",
     "monto_total_gastado",
+    "ratio_actividad_reciente",
+    "cv_gap_visitas",
+    "monto_gastado_ultimos_90d",
 ]
 
 CORRELATION_FEATURES = [
@@ -49,6 +52,9 @@ CORRELATION_FEATURES = [
     "pct_visitas_fin_de_semana",
     "monto_total_gastado",
     "monto_promedio_venta",
+    "ratio_actividad_reciente",
+    "cv_gap_visitas",
+    "monto_gastado_ultimos_90d",
 ]
 
 _DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
