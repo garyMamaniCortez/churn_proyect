@@ -41,7 +41,7 @@ def _build(config, servicios, personas, inscripciones, registros_acceso=None, ve
         registros_acceso
         if registros_acceso is not None
         else _empty(["persona_id", "servicio_id", "acceso_estado", "fecha"]),
-        ventas if ventas is not None else _empty(["persona_id", "venta_servicio_id", "total"]),
+        ventas if ventas is not None else _empty(["persona_id", "venta_servicio_id", "total", "fecha"]),
         pagos if pagos is not None else _empty(["persona_id", "pago_estado"]),
     )
 
@@ -141,6 +141,105 @@ def test_no_estado_or_age_columns_are_present(config, servicios):
     out = _build(config, servicios, _personas([1]), inscripciones)
     for forbidden in ("edad", "edad_desconocida", "persona_estado", "estado_membresia", "churn_label"):
         assert forbidden not in out.columns
+
+
+def test_cv_gap_visitas_needs_at_least_three_checkins(config, servicios):
+    inscripciones = pd.DataFrame(
+        {
+            "inscripcion_id": [1],
+            "persona_id": [1],
+            "servicio_id": [2],
+            "sucursal_id": [1],
+            "fecha_inicio": ["2026-08-01"],
+            "fecha_vencimiento": ["2026-08-31"],
+            "ingresos_disponibles": [20],
+        }
+    )
+    # Only 2 check-ins -> 1 gap -> not enough to compute a coefficient of variation.
+    registros_dos = pd.DataFrame(
+        {
+            "persona_id": [1, 1],
+            "servicio_id": [2, 2],
+            "acceso_estado": ["exitoso", "exitoso"],
+            "fecha": ["2026-08-05 08:00:00", "2026-08-12 08:00:00"],
+        }
+    )
+    out = _build(config, servicios, _personas([1]), inscripciones, registros_acceso=registros_dos)
+    assert pd.isna(out.set_index("persona_id").loc[1, "cv_gap_visitas"])
+
+    # A perfectly regular client (visits every 7 days) should have cv close to 0.
+    registros_regular = pd.DataFrame(
+        {
+            "persona_id": [1, 1, 1, 1],
+            "servicio_id": [2, 2, 2, 2],
+            "acceso_estado": ["exitoso"] * 4,
+            "fecha": [
+                "2026-08-05 08:00:00",
+                "2026-08-12 08:00:00",
+                "2026-08-19 08:00:00",
+                "2026-08-26 08:00:00",
+            ],
+        }
+    )
+    out_regular = _build(
+        config, servicios, _personas([1]), inscripciones, registros_acceso=registros_regular
+    )
+    assert out_regular.set_index("persona_id").loc[1, "cv_gap_visitas"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_ratio_actividad_reciente_flags_acceleration_and_deceleration(config, servicios):
+    inscripciones = pd.DataFrame(
+        {
+            "inscripcion_id": [1],
+            "persona_id": [1],
+            "servicio_id": [2],
+            "sucursal_id": [1],
+            "fecha_inicio": ["2026-02-01"],
+            "fecha_vencimiento": ["2026-08-31"],
+            "ingresos_disponibles": [20],
+        }
+    )
+    # Steady visitor for ~6 months (weekly), which sets a baseline weekly
+    # frequency, then nothing at all in the most recent 30 days -> decelerating.
+    fechas_historicas = pd.date_range("2026-02-05", "2026-07-25", freq="14D")
+    registros = pd.DataFrame(
+        {
+            "persona_id": [1] * len(fechas_historicas),
+            "servicio_id": [2] * len(fechas_historicas),
+            "acceso_estado": ["exitoso"] * len(fechas_historicas),
+            "fecha": [d.strftime("%Y-%m-%d 08:00:00") for d in fechas_historicas],
+        }
+    )
+    out = _build(config, servicios, _personas([1]), inscripciones, registros_acceso=registros)
+    row = out.set_index("persona_id").loc[1]
+    assert row["n_checkins_ultimos_30d"] == 0
+    assert row["ratio_actividad_reciente"] < 1
+
+
+def test_monto_gastado_ultimos_90d_only_counts_recent_sales(config, servicios):
+    inscripciones = pd.DataFrame(
+        {
+            "inscripcion_id": [1],
+            "persona_id": [1],
+            "servicio_id": [2],
+            "sucursal_id": [1],
+            "fecha_inicio": ["2026-01-01"],
+            "fecha_vencimiento": ["2026-01-31"],
+            "ingresos_disponibles": [20],
+        }
+    )
+    ventas = pd.DataFrame(
+        {
+            "persona_id": [1, 1],
+            "venta_servicio_id": [1, 2],
+            "total": [100.0, 50.0],
+            "fecha": ["2026-01-01 10:00:00", "2026-08-15 10:00:00"],  # one old, one recent
+        }
+    )
+    out = _build(config, servicios, _personas([1]), inscripciones, ventas=ventas)
+    row = out.set_index("persona_id").loc[1]
+    assert row["monto_total_gastado"] == pytest.approx(150.0)
+    assert row["monto_gastado_ultimos_90d"] == pytest.approx(50.0)
 
 
 def test_membership_usage_ignores_inscripciones_before_reliable_tracking_cutoff(config, servicios):
