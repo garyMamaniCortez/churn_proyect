@@ -142,6 +142,27 @@ solo lectura.
   menor uso de la membresía, pero con dispersión suficiente como para esperar
   más de un segmento dentro de cada nivel de recencia.
 
+## Intento adicional: check-ins relativos al propio abandono (2026-09-02)
+
+El usuario preguntó si convenía medir `n_checkins_ultimos_30d` en relación al
+comportamiento propio del cliente antes de irse, en vez de siempre en relación
+a "hoy" para todos por igual. Se verificó empíricamente: dentro del cluster
+"frenado", `n_checkins_ultimos_30d` (desde hoy) tiene mediana 0, prácticamente
+sin varianza, mientras que la misma ventana de 30 días medida desde el
+**último check-in propio de cada cliente** tiene mediana 5 y llega hasta 25.
+Para los clientes activos, ambas versiones correlacionan 0.84 entre sí (casi
+lo mismo, tiene sentido: su último check-in es reciente).
+
+Se agregó `checkins_ultimo_mes_activo` a `features.py` con esa lógica. Al
+meterla en el clustering, sin embargo, **bajó el silhouette de 0.273 a 0.257**:
+correlaciona 0.87 con `porcentaje_uso_membresia` (ambas miden, en el fondo,
+"qué tan intenso era este cliente mientras estaba activo"), así que sumarla
+solo duplicaba peso en una dimensión que ya estaba representada, en vez de
+aportar una dimensión nueva. Se sacó de `CLUSTER_FEATURES` pero se dejó en la
+tabla de salida como columna descriptiva: no ayuda a *definir* los clusters,
+pero sí sirve para *explicarlos* después (por ejemplo, comparar qué tan
+intensos eran los clientes de cada cluster en su último mes activo).
+
 ## Enriquecimiento de features (2026-09-02): variables de tendencia y regularidad
 
 Las 8 features originales solo describían "nivel" (cuánto, qué tan seguido),
@@ -186,6 +207,68 @@ Perfil actualizado de los 2 clusters (jerárquico, ganador):
 | % uso membresía | 22% | 35% |
 | Gasto últimos 90 días | $58 | $269 |
 | Inscripciones totales | 1.43 | 3.93 |
+
+**Nota de diseño:** se evaluó agregar el `cluster` de la segmentación como
+feature del dataset de churn, pero se decidió NO hacerlo por ahora. Pegar el
+cluster de `clientes_segmentados.csv` (calculado con el comportamiento
+completo hasta hoy) a un ciclo de membresía vencido hace meses filtraría
+información futura relativa al corte de ese ciclo. Hacerlo bien requeriría
+reentrenar con K-Means (el único de los tres algoritmos que puede asignar
+cluster a un punto nuevo con solo sus features, ya que el ganador por
+silhouette fue jerárquico, que no generaliza a datos nuevos) y recalcular un
+cluster por cada fila usando solo sus propias features. Se dejan segmentación
+y churn como dos análisis complementarios pero independientes; revisar esta
+decisión si más adelante se justifica el trabajo extra.
+
+## Dataset de churn: una fila por ciclo de membresía, no por cliente (2026-09-02)
+
+`churn_detection/churn_dataset.py` (`ChurnCycleDatasetBuilder`) construye el
+dataset de entrenamiento para el modelo de churn, con una arquitectura
+distinta a la de segmentación:
+
+**Por qué una fila por ciclo y no por cliente:** usar la última membresía de
+cada cliente como única observación es circular. Si el cliente renovó, esa
+renovación pasa a ser su membresía "más reciente", así que la que se estaba
+evaluando nunca puede resolver en "renovó" bajo esa definición, solo en
+"abandonó" o "todavía sin resolver". Un modelo entrenado así jamás vería un
+ejemplo positivo de retención. La solución: cada inscripción de tipo
+membresía que un cliente tuvo es su propia observación. Un cliente con 3
+membresías a lo largo del tiempo aporta hasta 3 filas.
+
+**Sin fuga de datos:** cada fila usa `fecha_vencimiento` de ESA membresía
+como corte. Todas sus features (check-ins, gasto, uso, antigüedad) se calculan
+únicamente con información con fecha anterior o igual a ese corte. Nada de lo
+que pasó durante o después del ciclo siguiente se usa para predecir el
+resultado de este.
+
+**Label y censura**, por ciclo:
+- `renovado` (`churn_label=0`): hubo una inscripción de membresía siguiente
+  que empezó dentro de `CHURN_GRACE_DAYS` días tras el vencimiento de esta.
+  Los pases de un solo día en el medio no cuentan como renovación.
+- `churned` (`churn_label=1`): no hubo renovación a tiempo, y ya pasó
+  suficiente tiempo como para saberlo con certeza.
+- `censurado` (`churn_label=NaN`): es el último ciclo conocido del cliente y
+  todavía está dentro de la ventana de gracia, no se sabe el resultado
+  todavía. Se excluye del entrenamiento; es exactamente el conjunto de
+  clientes a los que se les aplicaría el modelo en producción.
+
+**Resultado real (2026-09-02, `CHURN_GRACE_DAYS=30`):** 8,573 ciclos de
+membresía, de los cuales 6,718 (78.4%) tienen resultado conocido: 3,548
+renovaron, 3,170 no. **Tasa de churn entre los ciclos con resultado: 47.2%**,
+un número mucho más razonable que el 76.6% que había dado el enfoque anterior
+(snapshot a "hoy" con sesgo de cohorte), justamente porque ahora cada ciclo se
+evalúa en su propio momento, no todos contra la misma fecha actual.
+
+Como control de calidad: comparando el promedio de las features entre ciclos
+`renovado` y `churned`, todas las diferencias van en la dirección esperada
+(los que abandonan tienen menos antigüedad, menos uso de membresía, menos
+ritmo reciente y menos gasto), lo cual es una señal de que el dataset es
+coherente antes de empezar a modelar.
+
+Salida: `data/processed/churn_ciclos.csv`, con columnas de identidad
+(`persona_id`, `inscripcion_id`, fechas), `estado_ciclo`, `churn_label`, y las
+mismas 11 features de comportamiento que en segmentación (calculadas de forma
+independiente, respetando el corte de cada fila).
 
 ## Segmentación: comparación de algoritmos (2026-09-01)
 
@@ -266,6 +349,11 @@ git commit -m "data: dataset de segmentacion de clientes"
     │   └── repository.py       <- ClientDataRepository (ABC) + PostgresClientDataRepository
     │
     ├── dataset.py              <- CLI (typer) to extract raw tables into data/raw/*.csv
+    │
+    ├── membership_utils.py     <- Shared: flag_membership_services (día-pass vs. membresía)
+    │
+    ├── churn_dataset.py        <- ChurnCycleDatasetBuilder: builds data/processed/churn_ciclos.csv
+    │                              (una fila por ciclo de membresía, sin fuga de datos)
     │
     ├── features.py             <- ClientSegmentationTableBuilder: builds
     │                              data/processed/clientes_segmentacion.csv

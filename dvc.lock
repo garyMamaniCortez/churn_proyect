@@ -9,8 +9,8 @@ stages:
       size: 3343
     - path: churn_detection/features.py
       hash: md5
-      md5: 95b4e181c4ac6c28936dbbb167ae92db
-      size: 18496
+      md5: 3f9d4b7744fedf557fa5f97c895f8d90
+      size: 18209
     - path: data/raw/inscripciones.csv
       hash: md5
       md5: d98e61774e501775d4de699802282589
@@ -100,3 +100,39 @@ stages:
       hash: md5
       md5: 10dfa198209598b09f97af2ebc83e6ad
       size: 78949
+  churn_dataset:
+    cmd: python -m churn_detection.churn_dataset
+    deps:
+    - path: churn_detection/churn_dataset.py
+      hash: md5
+      md5: e36baf2ce18dce67915efdafb57d8b49
+      size: 11773
+    - path: churn_detection/membership_utils.py
+      hash: md5
+      md5: 9af2802f307028ae0e336a09db6b50d2
+      size: 1148
+    - path: data/raw/inscripciones.csv
+      hash: md5
+      md5: d98e61774e501775d4de699802282589
+      size: 432490
+    - path: data/raw/personas.csv
+      hash: md5
+      md5: 46498ae3c6a378325d1b6403148471c6
+      size: 54074
+    - path: data/raw/registros_acceso.csv
+      hash: md5
+      md5: 58c4d8b540f5382b20da85ad630ed286
+      size: 3493073
+    - path: data/raw/servicios.csv
+      hash: md5
+      md5: 8bbb7e6ce0641fbf57a7f688712405da
+      size: 1410
+    - path: data/raw/ventas_servicios.csv
+      hash: md5
+      md5: 3e3c1e1786e5e73725e9371292896752
+      size: 638664
+    outs:
+    - path: data/processed/churn_ciclos.csv
+      hash: md5
+      md5: 0b56ce20a3474ebf69d223fc0a6f5cf3
+      size: 1287560

@@ -35,3 +35,16 @@ stages:
       - data/processed/perfil_clusters.csv
       - data/processed/comparacion_algoritmos.csv
       - reports/figures/06_seleccion_k.png
+
+  churn_dataset:
+    cmd: python -m churn_detection.churn_dataset
+    deps:
+      - churn_detection/churn_dataset.py
+      - churn_detection/membership_utils.py
+      - data/raw/personas.csv
+      - data/raw/inscripciones.csv
+      - data/raw/servicios.csv
+      - data/raw/registros_acceso.csv
+      - data/raw/ventas_servicios.csv
+    outs:
+      - data/processed/churn_ciclos.csv

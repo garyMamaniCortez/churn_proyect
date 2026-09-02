@@ -42,6 +42,7 @@ import numpy as np
 import pandas as pd
 
 from churn_detection.config import RELIABLE_ACCESS_TRACKING_SINCE
+from churn_detection.membership_utils import flag_membership_services
 
 
 @dataclass(frozen=True)
@@ -74,7 +75,7 @@ class ClientSegmentationTableBuilder:
     ) -> pd.DataFrame:
         personas = self._exclude_bad_personas(personas)
         inscripciones = inscripciones.merge(
-            self._flag_membership_services(servicios), on="servicio_id", how="left"
+            flag_membership_services(servicios), on="servicio_id", how="left"
         )
 
         lifecycle = self._build_lifecycle_features(inscripciones)
@@ -123,15 +124,6 @@ class ClientSegmentationTableBuilder:
 
     def _exclude_bad_personas(self, personas: pd.DataFrame) -> pd.DataFrame:
         return personas[~personas["persona_id"].isin(self._config.excluded_persona_ids)].copy()
-
-    @staticmethod
-    def _flag_membership_services(servicios: pd.DataFrame) -> pd.DataFrame:
-        is_day_pass = (servicios["cantidad_duracion"] == 1) & (
-            servicios["tipo_duracion"] == "dias"
-        )
-        return servicios.assign(es_membresia=~is_day_pass)[
-            ["servicio_id", "es_membresia", "numero_ingresos"]
-        ]
 
     def _build_lifecycle_features(self, inscripciones: pd.DataFrame) -> pd.DataFrame:
         insc = inscripciones.copy()
