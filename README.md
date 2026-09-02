@@ -142,6 +142,69 @@ solo lectura.
   menor uso de la membresía, pero con dispersión suficiente como para esperar
   más de un segmento dentro de cada nivel de recencia.
 
+## Enriquecimiento de features (2026-09-02): variables de tendencia y regularidad
+
+Las 8 features originales solo describían "nivel" (cuánto, qué tan seguido),
+no "dirección". Se agregaron 3 features nuevas a `features.py` para capturar
+eso:
+
+- **`ratio_actividad_reciente`**: check-ins de los últimos 30 días contra el
+  ritmo semanal histórico del propio cliente. `<1` significa que está
+  frenando, `>1` que está acelerando. Dos clientes con la misma frecuencia
+  promedio pueden estar yendo en direcciones opuestas, y eso era invisible
+  antes.
+- **`cv_gap_visitas`**: coeficiente de variación de los días entre visitas
+  consecutivas. Mide qué tan regular es el ritmo de asistencia, no cuán
+  seguido viene. Requiere al menos 3 check-ins; si no, `NaN`.
+- **`monto_gastado_ultimos_90d`**: gasto en los últimos 90 días, análogo a los
+  check-ins recientes pero para dinero. No depende de
+  `RELIABLE_ACCESS_TRACKING_SINCE` porque las ventas no pasan por el módulo de
+  accesos que falló.
+
+**Bug encontrado y corregido en el camino:** al construir `ratio_actividad_reciente`
+se detectó que `n_checkins_ultimos_30d`/`90d` quedaban en `NaN` en vez de `0`
+para cualquier cliente sin check-ins en esa ventana, porque el `groupby` sobre
+esa ventana simplemente omite a esos clientes en lugar de darles una fila en
+cero. El `fillna(0)` que ya existía corría demasiado tarde para evitar que ese
+`NaN` se propagara. Esto afectaba silenciosamente al dataset de la fase
+anterior; ya está corregido y cubierto con test.
+
+Con las 3 features nuevas, el clustering se re-corrió comparando K-Means, GMM
+y jerárquico (11 features en total, ver `CLUSTER_FEATURES` en
+`segmentation.py`): el mejor silhouette subió de **0.228 a 0.273** (jerárquico,
+k=2), y los tres algoritmos ahora coinciden mucho más claramente en que k=2 es
+la mejor opción, con una caída más nítida después (ver
+`reports/figures/06_seleccion_k.png`). Sigue siendo una separación débil, no
+fuerte, pero es una mejora real y no un empate como antes.
+
+Perfil actualizado de los 2 clusters (jerárquico, ganador):
+
+| | Cluster 0 (80%, 3,540) | Cluster 1 (20%, 894) |
+|---|---|---|
+| Recencia (días desde último check-in) | 70 | 8 |
+| Ritmo reciente vs. histórico | 0.11 (muy frenado) | 0.91 (estable) |
+| % uso membresía | 22% | 35% |
+| Gasto últimos 90 días | $58 | $269 |
+| Inscripciones totales | 1.43 | 3.93 |
+
+## Segmentación: comparación de algoritmos (2026-09-01)
+
+Con K-Means solo, el mejor silhouette fue 0.228 en k=2, un valor débil (por
+debajo de 0.25 se considera que no hay evidencia sólida de clusters bien
+separados). Para descartar que fuera una limitación propia de K-Means, se
+agregó `churn_detection/modeling/segmentation.py` con **Gaussian Mixture** y
+**clustering jerárquico (Ward)**, comparables en la misma tabla vía
+`compare_algorithms()`.
+
+Resultado con las 8 features originales: los tres coincidían en que k=2 era la
+mejor opción disponible, sin separación fuerte. Ver la sección de arriba para
+el resultado actualizado tras agregar las features de tendencia.
+
+El split de k=2 queda guardado en `data/processed/clientes_segmentados.csv`
+(persona + `cluster` + `datos_incompletos`) y perfilado en
+`data/processed/perfil_clusters.csv`. La columna `comparacion_algoritmos.csv`
+deja el detalle completo (silhouette y BIC por algoritmo y k).
+
 ## Cómo construir el dataset de segmentación (después de extraer los datos)
 
 ```powershell
