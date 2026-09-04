@@ -1,8 +1,8 @@
-"""Small shared helpers used by both the segmentation and churn dataset builders.
+"""Shared helper used by the churn dataset builder.
 
-Kept in its own module (not a method on either builder) so both can import the
-same logic without one depending on the other -- avoids duplicating the
-day-pass-vs-membership rule in two places where it could quietly drift apart.
+Kept in its own module rather than as a method on the builder, so the
+day-pass-vs-membership rule is easy to find, review, and reuse if another
+module needs it later.
 """
 
 from __future__ import annotations

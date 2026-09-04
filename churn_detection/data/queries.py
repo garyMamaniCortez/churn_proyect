@@ -8,7 +8,7 @@ Privacy / governance note
 --------------------------
 `personas.ci`, `personas.telefono` and `personas.huella_digital` (a fingerprint
 template) are intentionally NEVER selected here. They are direct/biometric
-identifiers with no predictive value for churn or segmentation, and pulling them
+identifiers with no predictive value for churn analysis, and pulling them
 into flat analytical CSVs that later get versioned with DVC would create an
 unnecessary PII/biometric-data exposure surface. `persona_id` is enough to join
 everything downstream.

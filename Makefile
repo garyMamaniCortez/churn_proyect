@@ -66,10 +66,10 @@ create_environment:
 extract-data: requirements
 	$(PYTHON_INTERPRETER) -m churn_detection.dataset extract-all
 
-## Build the client segmentation table from data/raw/ -> data/processed/clientes_segmentacion.csv
-.PHONY: build-features
-build-features: requirements
-	$(PYTHON_INTERPRETER) -m churn_detection.features
+## Run the full churn pipeline (dataset -> EDA -> train -> score) via DVC
+.PHONY: churn-pipeline
+churn-pipeline: requirements
+	dvc repro
 
 ## Version the freshly extracted raw data with DVC
 .PHONY: version-data
@@ -78,10 +78,6 @@ version-data:
 		data/raw/registros_acceso.csv data/raw/ventas_servicios.csv data/raw/pagos_pendientes.csv
 	@echo ">>> Now git add the resulting data/raw/*.dvc files and commit."
 
-## run EDA analisis
-.PHONY: eda-analisis
-eda-analisis:
-	$(PYTHON_INTERPRETER) -m churn_detection.plots
 
 #################################################################################
 # Self Documenting Commands                                                     #

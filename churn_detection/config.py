@@ -59,7 +59,7 @@ class ChurnSettings(BaseSettings):
 
 
 # Known bad/non-representative persona_id values to exclude from client-level
-# analysis (segmentation + churn). Found during EDA on 2026-08-30:
+# analysis. Found during EDA on 2026-08-30:
 #   32 -> generic front-desk "walk-in / day-pass" account: 1,857 inscripciones /
 #         1,857 ventas but only 42 check-ins (2% ratio, next-highest client in the
 #         whole dataset has 11 inscripciones). fecha_nacimiento is 2016-02-29,
@@ -75,6 +75,12 @@ EXCLUDED_PERSONA_IDS: frozenset[int] = frozenset({32})
 # from data before this date measures the outage, not the customer. Treat it as
 # unreliable -> NaN, never as "0 visits" / "0% usage".
 RELIABLE_ACCESS_TRACKING_SINCE = pd.Timestamp("2026-02-01")
+
+# MLflow experiment tracking. SQLite backend under the project root (MLflow
+# 3.x put the plain filesystem backend into maintenance mode) -- still fully
+# local, no tracking server needed for this project's scale.
+MLFLOW_TRACKING_URI = f"sqlite:///{PROJ_ROOT / 'mlflow.db'}"
+MLFLOW_EXPERIMENT_NAME = "churn_gimnasio"
 
 
 # If tqdm is installed, configure loguru with tqdm.write

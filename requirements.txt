@@ -9,7 +9,7 @@ tqdm
 typer
 -e .
 
-# Data extraction / versioning (Phase 1: extraction + EDA)
+# Data extraction / versioning
 sqlalchemy>=2.0
 psycopg2-binary
 pandas
@@ -17,10 +17,15 @@ pydantic>=2.0
 pydantic-settings
 dvc
 
-# Added in later phases as we build them:
-scikit-learn
+# EDA / churn modeling
 matplotlib
 seaborn
-# mlflow                               -> experiment tracking
+scikit-learn
+mlflow
+tensorflow
+# ^ if you're on a machine with no GPU and want a smaller install,
+#   `tensorflow-cpu` is a drop-in replacement.
+
+# Added in a later phase, once we build the serving API:
 # fastapi, uvicorn                     -> model serving
 
