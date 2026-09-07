@@ -26,8 +26,9 @@ from dataclasses import dataclass
 
 import pandas as pd
 from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -55,13 +56,12 @@ FEATURE_COLUMNS = [
 ]
 
 # Right-skewed features flagged during EDA (reports/figures/10_*.png). Only
-# gradient-descent-trained models need this: the neural network's inputs are
-# scale-sensitive (unscaled/skewed inputs make gradient descent converge
-# poorly), and its StandardScaler step computes mean/std, which long right
-# tails distort. Tree-based models (Random Forest, Hist Gradient Boosting)
-# split on thresholds, so they're invariant to any monotonic transform of a
-# feature -- applying log1p to them would be a no-op on their predictions,
-# not a fix.
+# gradient-descent-trained models need this: logistic regression and the
+# neural network have scale-sensitive inputs (unscaled/skewed inputs make
+# gradient descent converge poorly), and their StandardScaler step computes
+# mean/std, which long right tails distort. Hist Gradient Boosting splits on
+# thresholds, so it's invariant to any monotonic transform of a feature --
+# applying log1p to it would be a no-op on its predictions, not a fix.
 SKEWED_FEATURES = [
     "tenure_dias",
     "recencia_dias",
@@ -255,22 +255,23 @@ class NeuralNetworkCandidate(ChurnModelCandidate):
         )
 
 
-class RandomForestCandidate(ChurnModelCandidate):
-    """Non-linear ensemble baseline. Also needs imputation (trees in sklearn
-    can't take NaN directly), but no scaling (tree splits are scale-invariant)."""
+class LogisticRegressionCandidate(ChurnModelCandidate):
+    """Interpretable linear baseline. Needs imputation, the same log1p transform
+    on the right-skewed features used by the neural network (see SKEWED_FEATURES),
+    and scaling -- in that order. Serves as the simple reference model that the
+    more complex candidates (Gradient Boosting, neural network) need to beat to
+    justify their extra complexity."""
 
-    name = "random_forest"
+    name = "logistic_regression"
 
     def build_pipeline(self) -> Pipeline:
+        skewed_idx = [FEATURE_COLUMNS.index(c) for c in SKEWED_FEATURES]
         return Pipeline(
             [
                 ("imputer", SimpleImputer(strategy="median")),
-                (
-                    "model",
-                    RandomForestClassifier(
-                        n_estimators=300, max_depth=8, random_state=42, n_jobs=-1
-                    ),
-                ),
+                ("log1p_skewed", FunctionTransformer(_Log1pSkewedColumns(skewed_idx))),
+                ("scaler", StandardScaler()),
+                ("model", LogisticRegression(max_iter=1000, random_state=42)),
             ]
         )
 
@@ -327,10 +328,11 @@ def plot_feature_importance(pipeline, X_test, y_test, model_name: str, output_pa
     """Saves a feature-importance bar chart for `pipeline`.
 
     Uses, in order of preference: `feature_importances_` (tree impurity-based,
-    e.g. Random Forest), `coef_` (linear models), and permutation importance
-    as a universal fallback for anything else (e.g. HistGradientBoosting,
-    which exposes neither of the above) -- so this never silently produces
-    nothing regardless of which candidate wins the comparison.
+    e.g. a tree-ensemble model), `coef_` (linear models, e.g. logistic
+    regression), and permutation importance as a universal fallback for
+    anything else (e.g. HistGradientBoosting or the neural network, which
+    expose neither of the above) -- so this never silently produces nothing
+    regardless of which candidate wins the comparison.
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -407,7 +409,7 @@ if __name__ == "__main__":
         mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
 
         candidates: list[ChurnModelCandidate] = [
-            RandomForestCandidate(),
+            LogisticRegressionCandidate(),
             HistGradientBoostingCandidate(),
             NeuralNetworkCandidate(),
         ]

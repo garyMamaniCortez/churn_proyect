@@ -8,7 +8,7 @@ from churn_detection.modeling.train import (
     HistGradientBoostingCandidate,
     ModelEvaluator,
     NeuralNetworkCandidate,
-    RandomForestCandidate,
+    LogisticRegressionCandidate,
 )
 
 
@@ -83,7 +83,7 @@ def test_split_never_puts_the_same_persona_on_both_sides(sample_df):
 
 @pytest.mark.parametrize(
     "candidate_factory",
-    [RandomForestCandidate, HistGradientBoostingCandidate, NeuralNetworkCandidate],
+    [LogisticRegressionCandidate, HistGradientBoostingCandidate, NeuralNetworkCandidate],
 )
 def test_every_candidate_fits_and_predicts_probabilities(sample_df, candidate_factory):
     split = GroupAwareSplitter().split(sample_df, FEATURE_COLUMNS)
@@ -144,7 +144,7 @@ def test_neural_network_pipeline_is_picklable(sample_df, tmp_path):
 
 def test_evaluator_returns_expected_metric_keys_within_bounds(sample_df):
     split = GroupAwareSplitter().split(sample_df, FEATURE_COLUMNS)
-    pipeline = RandomForestCandidate().build_pipeline()
+    pipeline = LogisticRegressionCandidate().build_pipeline()
     pipeline.fit(split.X_train, split.y_train)
     y_pred = pipeline.predict(split.X_test)
     y_proba = pipeline.predict_proba(split.X_test)[:, 1]
@@ -159,30 +159,30 @@ def test_evaluator_returns_expected_metric_keys_within_bounds(sample_df):
 
 def test_plot_confusion_matrix_writes_a_file(sample_df, tmp_path):
     split = GroupAwareSplitter().split(sample_df, FEATURE_COLUMNS)
-    pipeline = RandomForestCandidate().build_pipeline()
+    pipeline = LogisticRegressionCandidate().build_pipeline()
     pipeline.fit(split.X_train, split.y_train)
 
     from churn_detection.modeling.train import plot_confusion_matrix
 
     output_path = tmp_path / "cm.png"
     result = plot_confusion_matrix(
-        pipeline, split.X_test, split.y_test, "random_forest", output_path
+        pipeline, split.X_test, split.y_test, "logistic_regression", output_path
     )
 
     assert result == output_path
     assert output_path.exists() and output_path.stat().st_size > 0
 
 
-def test_plot_feature_importance_writes_a_file_for_tree_model(sample_df, tmp_path):
+def test_plot_feature_importance_writes_a_file_for_linear_coefficients(sample_df, tmp_path):
     split = GroupAwareSplitter().split(sample_df, FEATURE_COLUMNS)
-    pipeline = RandomForestCandidate().build_pipeline()
+    pipeline = LogisticRegressionCandidate().build_pipeline()
     pipeline.fit(split.X_train, split.y_train)
 
     from churn_detection.modeling.train import plot_feature_importance
 
     output_path = tmp_path / "fi.png"
     result = plot_feature_importance(
-        pipeline, split.X_test, split.y_test, "random_forest", output_path
+        pipeline, split.X_test, split.y_test, "logistic_regression", output_path
     )
 
     assert result == output_path

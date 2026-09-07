@@ -84,8 +84,10 @@ resultado de este.
   clientes a los que se les aplicaría el modelo en producción.
 
 **Resultado real (`CHURN_GRACE_DAYS=30`):** 8,573 ciclos de membresía, de los
-cuales 6,728 (78.5%) tienen resultado conocido: 3,548 renovaron, 3,180 no.
-**Tasa de churn entre los ciclos con resultado: ~47.3%.**
+cuales 6,750 (78.7%) tienen resultado conocido: 3,548 renovaron, 3,202 no.
+**Tasa de churn entre los ciclos con resultado: ~47.4%.** (Estos números
+avanzan levemente cada vez que se corre el pipeline en una fecha distinta,
+ver nota de reproducibilidad temporal más abajo.)
 
 Como control de calidad: comparando el promedio de las features entre ciclos
 `renovado` y `churned`, todas las diferencias van en la dirección esperada
@@ -133,8 +135,8 @@ así a propósito):
 
 | | Imputación de nulos | Escalado | Log1p en features asimétricas |
 |---|---|---|---|
+| Regresión logística | mediana | `StandardScaler` | sí (`SKEWED_FEATURES`) |
 | Red neuronal (TensorFlow) | mediana | `StandardScaler` | sí (`SKEWED_FEATURES`) |
-| Random Forest | mediana | no (invariante a escala) | no (invariante a transformaciones monótonas) |
 | Hist Gradient Boosting | no, usa `NaN` nativo | no | no |
 
 No se hizo eliminación de outliers como paso de modelado: los valores
@@ -145,7 +147,21 @@ outlier real de todo el proyecto (una cuenta genérica de recepción usada para
 pases de día, id=32) ya se excluye en `config.EXCLUDED_PERSONA_IDS`, antes de
 llegar a este dataset.
 
-### Red neuronal (reemplazó a la regresión logística)
+### Por qué volvió la regresión logística (como baseline, no como reemplazo)
+
+En una iteración anterior se había sacado la regresión logística del proyecto
+para meter la red neuronal, dejando la comparación entre Random Forest, Hist
+Gradient Boosting y la red neuronal: tres modelos "complejos" entre sí, sin
+ningún modelo de referencia simple. Al revisar la monografía contra una lista
+de errores frecuentes en proyectos de Ciencia de Datos, esto encajaba
+directamente en uno de ellos: *no definir un modelo baseline*, es decir, no
+tener cómo demostrar que la complejidad extra de los otros modelos realmente
+se traduce en mejor desempeño. Se sacó **Random Forest** (quedaba redundante
+con Hist Gradient Boosting, ambos basados en árboles) y volvió la **regresión
+logística**, esta vez explícitamente como el modelo de referencia contra el
+que se comparan los otros dos.
+
+### Red neuronal
 
 `KerasBinaryClassifier` es un wrapper propio (no `scikeras`, para no sumar una
 dependencia extra) que hace que un modelo de Keras se comporte como cualquier
@@ -157,36 +173,41 @@ salida sigmoide, optimizador Adam, 40 épocas.
 **Bug encontrado y corregido al implementarla:** un modelo de Keras crudo
 **no es serializable con joblib/pickle** por defecto (tiene estado interno de
 TensorFlow que no se puede picklear tal cual). Es el mismo tipo de bug que ya
-nos había pasado con la regresión logística (ahí era una función closure
-local). Se corrigió implementando `__getstate__`/`__setstate__` en
-`KerasBinaryClassifier`: al picklear, el modelo se guarda con el formato
+nos había pasado con la regresión logística la primera vez (ahí era una
+función closure local). Se corrigió implementando `__getstate__`/`__setstate__`
+en `KerasBinaryClassifier`: al picklear, el modelo se guarda con el formato
 nativo de Keras a un archivo temporal y se convierte a bytes; al despicklear,
 se reconstruye desde esos bytes. Cubierto por
 `test_neural_network_pipeline_is_picklable`, siguiendo el mismo patrón de
 "agregar el test que hubiera atrapado esto" que ya usamos antes.
 
-**Dos bugs adicionales corregidos en fases anteriores de esta etapa:**
-1. La regresión logística (ahora eliminada) no tenía la transformación
-   `log1p` en las variables asimétricas. Al corregirlo en su momento, su
-   ROC-AUC había subido de 0.777 a 0.790.
-2. Ese mismo `log1p` estaba originalmente definido como closure local, lo
-   cual tampoco es picklable — se corrigió moviéndolo a una clase a nivel de
-   módulo (`_Log1pSkewedColumns`), reutilizada ahora también por la red
-   neuronal.
+**Otro bug corregido en el camino:** la transformación `log1p` de las
+variables asimétricas estaba originalmente definida como closure local, lo
+cual tampoco es picklable. Se corrigió moviéndola a una clase a nivel de
+módulo (`_Log1pSkewedColumns`), compartida hoy entre la regresión logística y
+la red neuronal.
 
 | Modelo | Accuracy | Precision | Recall | F1 | ROC-AUC | PR-AUC |
 |---|---|---|---|---|---|---|
-| **Hist Gradient Boosting** (ganador) | 0.745 | 0.713 | 0.763 | 0.737 | **0.823** | 0.797 |
-| Random Forest | 0.736 | 0.709 | 0.740 | 0.724 | 0.818 | 0.793 |
-| Red neuronal (TensorFlow) | 0.720 | 0.692 | 0.724 | 0.708 | 0.810 | 0.774 |
+| **Hist Gradient Boosting** (ganador) | 0.720 | 0.687 | 0.740 | 0.713 | **0.805** | 0.766 |
+| Red neuronal (TensorFlow) | 0.714 | 0.685 | 0.723 | 0.704 | 0.800 | 0.760 |
+| Regresión logística (baseline) | 0.715 | 0.688 | 0.721 | 0.704 | 0.786 | 0.732 |
 
-Los tres por encima de 0.81 de ROC-AUC con un split honesto (agrupado por
-cliente). La red neuronal queda última, no muy lejos de los otros dos, pero
-sin superarlos, algo esperable con un dataset tabular relativamente chico (11
-features, ~5,000 filas de entrenamiento): los modelos basados en árboles
-suelen ganarle a una red densa en este régimen de datos, donde no hay
-suficiente volumen para que la red aproveche su capacidad extra. Se guardó
-Hist Gradient Boosting en `models/churn_model.joblib`.
+Los tres por encima de 0.78 de ROC-AUC con un split honesto (agrupado por
+cliente), y ahora sí queda claro que el modelo ganador **supera al baseline**
+(0.805 vs. 0.786), no solo a otros modelos igual de complejos. La red
+neuronal queda en el medio, muy cerca de Hist Gradient Boosting, sin
+superarlo, algo esperable con un dataset tabular relativamente chico (11
+features, ~5,000 filas de entrenamiento). Se guardó Hist Gradient Boosting en
+`models/churn_model.joblib`.
+
+**Nota sobre reproducibilidad temporal:** `churn_dataset.py` usa la fecha
+actual como corte para decidir qué ciclos están `censurado` vs. ya resueltos,
+así que volver a correr `dvc repro` en una fecha distinta puede mover
+ligeramente algunos ciclos de `censurado` a `churned` (los que ya agotaron su
+ventana de gracia desde la última corrida) y cambiar las métricas en un
+margen pequeño. No es no determinismo del modelo, es que el "hoy" del
+snapshot efectivamente avanza.
 
 Como ese modelo no expone `feature_importances_` ni `coef_`, la importancia
 de variables (`reports/figures/13_*.png`) se calculó con **permutation
@@ -204,10 +225,11 @@ no ruido aleatorio.
 ## Scoring de clientes en riesgo
 
 `churn_detection/modeling/predict.py` puntúa únicamente los ciclos
-`censurado` (los ~1,845 clientes sin resultado resuelto todavía) y los
-clasifica en riesgo bajo/medio/alto. `data/processed/predicciones_churn.csv`
-queda ordenado de mayor a menor probabilidad de abandono, listo para que el
-equipo de retención lo use como lista de priorización.
+`censurado` (1,823 clientes sin resultado resuelto todavía, al último corte)
+y los clasifica en riesgo bajo/medio/alto (733 alto, 364 medio, 726 bajo).
+`data/processed/predicciones_churn.csv` queda ordenado de mayor a menor
+probabilidad de abandono, listo para que el equipo de retención lo use como
+lista de priorización.
 
 ## Pipeline de DVC
 

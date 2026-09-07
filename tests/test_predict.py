@@ -5,7 +5,7 @@ import pytest
 from typer.testing import CliRunner
 
 from churn_detection.modeling.predict import app
-from churn_detection.modeling.train import FEATURE_COLUMNS, RandomForestCandidate
+from churn_detection.modeling.train import FEATURE_COLUMNS, LogisticRegressionCandidate
 
 
 @pytest.fixture
@@ -14,7 +14,7 @@ def trained_model_path(tmp_path):
     n = 40
     df = pd.DataFrame({col: rng.uniform(0, 10, n) for col in FEATURE_COLUMNS})
     labels = rng.integers(0, 2, n)
-    pipeline = RandomForestCandidate().build_pipeline()
+    pipeline = LogisticRegressionCandidate().build_pipeline()
     pipeline.fit(df, labels)
 
     model_path = tmp_path / "model.joblib"
