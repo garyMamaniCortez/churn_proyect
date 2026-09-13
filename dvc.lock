@@ -34,8 +34,8 @@ stages:
     outs:
     - path: data/processed/churn_ciclos.csv
       hash: md5
-      md5: 782a75e57d9b1b4f5f21d399a6396d03
-      size: 1287592
+      md5: db0bcaccf593ccbcfffa540f6b90f05d
+      size: 1287652
   churn_eda:
     cmd: python -m churn_detection.churn_plots
     deps:
@@ -45,21 +45,21 @@ stages:
       size: 5799
     - path: data/processed/churn_ciclos.csv
       hash: md5
-      md5: 782a75e57d9b1b4f5f21d399a6396d03
-      size: 1287592
+      md5: db0bcaccf593ccbcfffa540f6b90f05d
+      size: 1287652
     outs:
     - path: reports/figures/08_churn_estado_ciclo.png
       hash: md5
-      md5: 98228cc27937c4b1fecb868d5fa73638
-      size: 53825
+      md5: ee5e59f520bf12f4f0bb9529bcc89e17
+      size: 53980
     - path: reports/figures/09_churn_missingness.png
       hash: md5
       md5: 7195eb84f67a06f02c95e8a1fab33644
       size: 57948
     - path: reports/figures/10_churn_distribuciones_por_label.png
       hash: md5
-      md5: dad578367a7465f785598804eb519da5
-      size: 421501
+      md5: 6ca36005765f683a7f3c24e8f9dd4044
+      size: 421768
     - path: reports/figures/11_churn_correlacion.png
       hash: md5
       md5: 0d57fe256381c33a8d60407237fb8c87
@@ -69,33 +69,33 @@ stages:
     deps:
     - path: churn_detection/modeling/train.py
       hash: md5
-      md5: 803a4b80377a9b27c9597cb639085a42
-      size: 18191
+      md5: f3dba3d063281e8102ccf0f3c2cd68e4
+      size: 22021
     - path: data/processed/churn_ciclos.csv
       hash: md5
-      md5: 782a75e57d9b1b4f5f21d399a6396d03
-      size: 1287592
+      md5: db0bcaccf593ccbcfffa540f6b90f05d
+      size: 1287652
     outs:
     - path: data/processed/comparacion_modelos_churn.csv
       hash: md5
-      md5: 474ee27550d3f110d68f9436d8ea5066
-      size: 437
+      md5: daf744f01b8f05b476d75ddb42c586ae
+      size: 640
     - path: models/churn_model.joblib
       hash: md5
-      md5: e33447de5b510ec344d1dbd2fd02dbeb
-      size: 382009
+      md5: d3a1d14867909e160fc703c9de84ded8
+      size: 301753
     - path: reports/figures/07_curvas_roc.png
       hash: md5
-      md5: 5f646d1a2af3957c5cfe80b0fb4fd5fc
-      size: 92520
+      md5: 666c50d2ae1ab5c687de99549f4f59e9
+      size: 94141
     - path: reports/figures/12_matriz_confusion.png
       hash: md5
-      md5: 3b72aa9fba5bfde16134dcd15e542fe3
-      size: 28335
+      md5: d97e7a5591069b67656aec410e203f3e
+      size: 28206
     - path: reports/figures/13_importancia_features.png
       hash: md5
-      md5: 6bacefe2eea815e543cd8c25d2485995
-      size: 71128
+      md5: bb5bff9f0e8ea02820c08c6f10f8592d
+      size: 70813
   score_churn:
     cmd: python -m churn_detection.modeling.predict
     deps:
@@ -105,14 +105,14 @@ stages:
       size: 2129
     - path: data/processed/churn_ciclos.csv
       hash: md5
-      md5: 782a75e57d9b1b4f5f21d399a6396d03
-      size: 1287592
+      md5: db0bcaccf593ccbcfffa540f6b90f05d
+      size: 1287652
     - path: models/churn_model.joblib
       hash: md5
-      md5: e33447de5b510ec344d1dbd2fd02dbeb
-      size: 382009
+      md5: d3a1d14867909e160fc703c9de84ded8
+      size: 301753
     outs:
     - path: data/processed/predicciones_churn.csv
       hash: md5
-      md5: 9977f20d2364645275ea3f3bccf90034
-      size: 83309
+      md5: f593669bb482bafca182acaa95bc69ed
+      size: 80490

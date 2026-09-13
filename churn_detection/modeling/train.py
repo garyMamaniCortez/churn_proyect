@@ -37,7 +37,7 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import GridSearchCV, GroupKFold, GroupShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
 
@@ -79,6 +79,7 @@ class ChurnSplit:
     X_test: pd.DataFrame
     y_train: pd.Series
     y_test: pd.Series
+    groups_train: pd.Series
 
 
 class GroupAwareSplitter:
@@ -100,16 +101,57 @@ class GroupAwareSplitter:
             X_test=test[feature_columns],
             y_train=train["churn_label"].astype(int),
             y_test=test["churn_label"].astype(int),
+            groups_train=train["persona_id"],
         )
 
 
 class ChurnModelCandidate(ABC):
-    """Contract every candidate model implements: build its own pipeline."""
+    """Contract every candidate model implements: build its own pipeline and
+    declare its own hyperparameter search space."""
 
     name: str
 
     @abstractmethod
     def build_pipeline(self) -> Pipeline: ...
+
+    def param_grid(self) -> dict:
+        """Grid of pipeline-step-prefixed hyperparameters to search over (e.g.
+        `{"model__C": [0.1, 1, 10]}`). Empty by default -- a candidate with
+        nothing worth tuning just skips the search (Open/Closed: adding a
+        candidate never requires touching the tuning code)."""
+        return {}
+
+
+class HyperparameterTuner:
+    """Grid search with group-aware cross-validation, by persona_id.
+
+    Same concern as `GroupAwareSplitter`, one level down: if a client's cycles
+    could land in different CV folds, a hyperparameter choice could look good
+    only because the model partly memorized that specific client, not because
+    it generalizes. `GroupKFold` guarantees every one of a client's cycles
+    stays in a single fold.
+
+    `n_jobs=1` on purpose: `GridSearchCV`'s default joblib backend forks/pickles
+    the estimator to worker processes, and one candidate wraps a live
+    TensorFlow model -- not worth the risk of a multiprocessing/TF interaction
+    bug for a search space this small.
+    """
+
+    def __init__(self, n_splits: int = 3, scoring: str = "roc_auc") -> None:
+        self._n_splits = n_splits
+        self._scoring = scoring
+
+    def tune(self, pipeline: Pipeline, param_grid: dict, X, y, groups) -> tuple[Pipeline, dict]:
+        if not param_grid:
+            pipeline.fit(X, y)
+            return pipeline, {}
+
+        cv = GroupKFold(n_splits=self._n_splits)
+        search = GridSearchCV(
+            pipeline, param_grid, scoring=self._scoring, cv=cv, n_jobs=1, refit=True
+        )
+        search.fit(X, y, groups=groups)
+        return search.best_estimator_, search.best_params_
 
 
 class _Log1pSkewedColumns:
@@ -132,7 +174,7 @@ class _Log1pSkewedColumns:
         return X
 
 
-class KerasBinaryClassifier(BaseEstimator, ClassifierMixin):
+class KerasBinaryClassifier(ClassifierMixin, BaseEstimator):
     """Minimal sklearn-compatible wrapper around a small Keras feed-forward
     network, so it can sit inside the same `Pipeline` API as every other
     candidate (`.fit`, `.predict`, `.predict_proba`).
@@ -254,6 +296,17 @@ class NeuralNetworkCandidate(ChurnModelCandidate):
             ]
         )
 
+    def param_grid(self) -> dict:
+        # Deliberately small: each combination refits the network from scratch
+        # for every CV fold, and unlike the other two candidates this one has
+        # no cheap way to skip redundant work. hidden_units controls capacity,
+        # learning_rate controls how well gradient descent actually converges
+        # in the fixed 40 epochs -- the two knobs most likely to matter here.
+        return {
+            "model__hidden_units": [(32, 16), (16, 8)],
+            "model__learning_rate": [1e-3, 1e-2],
+        }
+
 
 class LogisticRegressionCandidate(ChurnModelCandidate):
     """Interpretable linear baseline. Needs imputation, the same log1p transform
@@ -275,6 +328,13 @@ class LogisticRegressionCandidate(ChurnModelCandidate):
             ]
         )
 
+    def param_grid(self) -> dict:
+        # C is the inverse of the regularization strength: smaller values
+        # penalize large coefficients more heavily. This is the one
+        # hyperparameter that meaningfully changes a logistic regression's
+        # behavior on a dataset this size.
+        return {"model__C": [0.01, 0.1, 1.0, 10.0]}
+
 
 class HistGradientBoostingCandidate(ChurnModelCandidate):
     """Handles NaN natively -- no imputation step at all.
@@ -289,6 +349,13 @@ class HistGradientBoostingCandidate(ChurnModelCandidate):
 
     def build_pipeline(self) -> Pipeline:
         return Pipeline([("model", HistGradientBoostingClassifier(random_state=42))])
+
+    def param_grid(self) -> dict:
+        return {
+            "model__max_iter": [100, 200, 300],
+            "model__max_depth": [None, 5, 10],
+            "model__learning_rate": [0.05, 0.1, 0.2],
+        }
 
 
 class ModelEvaluator:
@@ -390,6 +457,7 @@ if __name__ == "__main__":
         comparison_path: Path = PROCESSED_DATA_DIR / "comparacion_modelos_churn.csv",
         figure_path: Path = FIGURES_DIR / "07_curvas_roc.png",
         selection_metric: str = "roc_auc",
+        cv_splits: int = 3,
     ) -> None:
         import joblib
         import matplotlib
@@ -413,6 +481,7 @@ if __name__ == "__main__":
             HistGradientBoostingCandidate(),
             NeuralNetworkCandidate(),
         ]
+        tuner = HyperparameterTuner(n_splits=cv_splits)
 
         results = []
         fitted_pipelines = {}
@@ -420,8 +489,21 @@ if __name__ == "__main__":
 
         for candidate in candidates:
             with mlflow.start_run(run_name=candidate.name):
-                pipeline = candidate.build_pipeline()
-                pipeline.fit(split.X_train, split.y_train)
+                grid = candidate.param_grid()
+                import numpy as np
+
+                n_combos = int(np.prod([len(v) for v in grid.values()])) if grid else 1
+                logger.info(
+                    f"{candidate.name}: probando {n_combos} combinaciones de hiperparámetros "
+                    f"con GroupKFold(n_splits={cv_splits})..."
+                )
+                pipeline, best_params = tuner.tune(
+                    candidate.build_pipeline(),
+                    grid,
+                    split.X_train,
+                    split.y_train,
+                    split.groups_train,
+                )
                 y_pred = pipeline.predict(split.X_test)
                 y_proba = pipeline.predict_proba(split.X_test)[:, 1]
                 metrics = ModelEvaluator.evaluate(split.y_test, y_pred, y_proba)
@@ -432,17 +514,25 @@ if __name__ == "__main__":
                         "n_train": len(split.X_train),
                         "n_test": len(split.X_test),
                         "n_features": len(FEATURE_COLUMNS),
+                        "cv_splits": cv_splits,
+                        **best_params,
                     }
                 )
                 mlflow.log_metrics(metrics)
                 mlflow.sklearn.log_model(pipeline, name="model", serialization_format="pickle")
 
-                results.append({"modelo": candidate.name, **metrics})
+                results.append(
+                    {
+                        "modelo": candidate.name,
+                        **metrics,
+                        "mejores_hiperparametros": best_params,
+                    }
+                )
                 fitted_pipelines[candidate.name] = pipeline
 
                 fpr, tpr, _ = roc_curve(split.y_test, y_proba)
                 ax.plot(fpr, tpr, label=f"{candidate.name} (AUC={metrics['roc_auc']:.3f})")
-                logger.success(f"{candidate.name}: {metrics}")
+                logger.success(f"{candidate.name}: {metrics} | mejores params: {best_params}")
 
         ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Azar")
         ax.set_xlabel("Tasa de falsos positivos")

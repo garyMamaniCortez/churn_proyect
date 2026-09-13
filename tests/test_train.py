@@ -6,6 +6,8 @@ from churn_detection.modeling.train import (
     FEATURE_COLUMNS,
     GroupAwareSplitter,
     HistGradientBoostingCandidate,
+    HyperparameterTuner,
+    KerasBinaryClassifier,
     ModelEvaluator,
     NeuralNetworkCandidate,
     LogisticRegressionCandidate,
@@ -206,3 +208,83 @@ def test_plot_feature_importance_falls_back_to_permutation_importance(sample_df,
 
     assert result == output_path
     assert output_path.exists() and output_path.stat().st_size > 0
+
+
+def test_split_exposes_groups_train_matching_training_personas(sample_df):
+    split = GroupAwareSplitter().split(sample_df, [*FEATURE_COLUMNS, "persona_id"])
+    assert len(split.groups_train) == len(split.X_train)
+    assert set(split.groups_train) == set(split.X_train["persona_id"])
+
+
+@pytest.mark.parametrize(
+    "candidate_factory",
+    [LogisticRegressionCandidate, HistGradientBoostingCandidate, NeuralNetworkCandidate],
+)
+def test_every_candidate_declares_a_non_empty_prefixed_param_grid(candidate_factory):
+    grid = candidate_factory().param_grid()
+    assert len(grid) > 0
+    for key in grid:
+        assert key.startswith("model__")
+
+
+def test_tuner_with_empty_grid_just_fits_the_pipeline(sample_df):
+    split = GroupAwareSplitter().split(sample_df, FEATURE_COLUMNS)
+    pipeline = HistGradientBoostingCandidate().build_pipeline()
+
+    tuner = HyperparameterTuner(n_splits=3)
+    fitted, best_params = tuner.tune(pipeline, {}, split.X_train, split.y_train, split.groups_train)
+
+    assert best_params == {}
+    proba = fitted.predict_proba(split.X_test)[:, 1]
+    assert (proba >= 0).all() and (proba <= 1).all()
+
+
+def test_tuner_picks_best_params_from_the_provided_grid(sample_df):
+    split = GroupAwareSplitter().split(sample_df, FEATURE_COLUMNS)
+    candidate = LogisticRegressionCandidate()
+
+    tuner = HyperparameterTuner(n_splits=3)
+    fitted, best_params = tuner.tune(
+        candidate.build_pipeline(),
+        candidate.param_grid(),
+        split.X_train,
+        split.y_train,
+        split.groups_train,
+    )
+
+    assert best_params["model__C"] in candidate.param_grid()["model__C"]
+    proba = fitted.predict_proba(split.X_test)[:, 1]
+    assert (proba >= 0).all() and (proba <= 1).all()
+
+
+def test_keras_binary_classifier_is_recognized_as_a_classifier_by_sklearn():
+    # Regression test: mixin/base-class declaration order matters for sklearn's
+    # cooperative __sklearn_tags__() resolution. `class Foo(BaseEstimator,
+    # ClassifierMixin)` silently fails to pick up ClassifierMixin's tags (MRO
+    # resolves BaseEstimator's __sklearn_tags__ first, which doesn't forward to
+    # the mixin), so `is_classifier()` returns False and GridSearchCV's scorer
+    # rejects the whole pipeline as "a regressor" with response_method=
+    # predict_proba. The fix is declaration order: ClassifierMixin first.
+    from sklearn.base import is_classifier
+
+    assert is_classifier(KerasBinaryClassifier())
+
+
+def test_tuner_works_end_to_end_for_the_neural_network_candidate(sample_df):
+    # Integration-level companion to the test above: GridSearchCV with
+    # scoring="roc_auc" must not raise for the neural network candidate.
+    split = GroupAwareSplitter().split(sample_df, FEATURE_COLUMNS)
+    candidate = NeuralNetworkCandidate()
+
+    tuner = HyperparameterTuner(n_splits=3)
+    fitted, best_params = tuner.tune(
+        candidate.build_pipeline(),
+        candidate.param_grid(),
+        split.X_train,
+        split.y_train,
+        split.groups_train,
+    )
+
+    assert best_params  # a real (non-empty) choice was made, not skipped
+    proba = fitted.predict_proba(split.X_test)[:, 1]
+    assert (proba >= 0).all() and (proba <= 1).all()

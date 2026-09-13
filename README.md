@@ -187,19 +187,52 @@ cual tampoco es picklable. Se corrigió moviéndola a una clase a nivel de
 módulo (`_Log1pSkewedColumns`), compartida hoy entre la regresión logística y
 la red neuronal.
 
-| Modelo | Accuracy | Precision | Recall | F1 | ROC-AUC | PR-AUC |
-|---|---|---|---|---|---|---|
-| **Hist Gradient Boosting** (ganador) | 0.720 | 0.687 | 0.740 | 0.713 | **0.805** | 0.766 |
-| Red neuronal (TensorFlow) | 0.714 | 0.685 | 0.723 | 0.704 | 0.800 | 0.760 |
-| Regresión logística (baseline) | 0.715 | 0.688 | 0.721 | 0.704 | 0.786 | 0.732 |
+### Tuning de hiperparámetros con validación cruzada agrupada
 
-Los tres por encima de 0.78 de ROC-AUC con un split honesto (agrupado por
-cliente), y ahora sí queda claro que el modelo ganador **supera al baseline**
-(0.805 vs. 0.786), no solo a otros modelos igual de complejos. La red
-neuronal queda en el medio, muy cerca de Hist Gradient Boosting, sin
-superarlo, algo esperable con un dataset tabular relativamente chico (11
-features, ~5,000 filas de entrenamiento). Se guardó Hist Gradient Boosting en
-`models/churn_model.joblib`.
+Hasta esta fase, los tres modelos entrenaban con hiperparámetros fijos a
+mano, nunca se había corrido una búsqueda real. Se agregó
+`HyperparameterTuner`, que envuelve `GridSearchCV` pero usando `GroupKFold`
+en vez de un k-fold común, agrupando por `persona_id` con el mismo criterio
+que `GroupAwareSplitter` ya usaba para el split train/test: si los folds de
+validación cruzada pudieran mezclar ciclos del mismo cliente, una
+combinación de hiperparámetros podría verse mejor solo porque el modelo
+memorizó parcialmente a ese cliente, no porque generalice mejor.
+
+Cada candidato declara su propia grilla vía `param_grid()` (patrón
+Open/Closed, igual que `build_pipeline()`): regresión logística busca sobre
+`C` (4 valores), Hist Gradient Boosting sobre `learning_rate`, `max_depth` y
+`max_iter` (27 combinaciones), y la red neuronal sobre `hidden_units` y
+`learning_rate` (4 combinaciones, deliberadamente chico porque cada
+combinación reentrena la red desde cero en cada fold).
+
+**Bug real encontrado al correr esto por primera vez:** `GridSearchCV` con
+`scoring="roc_auc"` fallaba para la red neuronal con el error *"Got a
+regressor with response_method=predict_proba"*. La causa: `KerasBinaryClassifier`
+estaba declarada como `class KerasBinaryClassifier(BaseEstimator,
+ClassifierMixin)`, y en scikit-learn 1.8 el orden de las clases base importa
+para que el sistema de tags (`__sklearn_tags__`) resuelva correctamente vía
+MRO. Con `BaseEstimator` primero, su propia implementación de
+`__sklearn_tags__` se ejecuta antes que la de `ClassifierMixin` y nunca
+incorpora `estimator_type="classifier"`, así que `is_classifier(...)` daba
+`False` para un modelo que evidentemente es un clasificador. Se corrigió
+invirtiendo el orden a `class KerasBinaryClassifier(ClassifierMixin,
+BaseEstimator)` (el orden que la propia documentación de scikit-learn
+recomienda y que fácilmente se pasa por alto), con dos tests dedicados que lo
+cubren: uno directo sobre `is_classifier()` y otro de integración corriendo
+`HyperparameterTuner` de punta a punta sobre la red neuronal.
+
+| Modelo | Accuracy | Precision | Recall | F1 | ROC-AUC | PR-AUC | Mejores hiperparámetros |
+|---|---|---|---|---|---|---|---|
+| **Hist Gradient Boosting** (ganador) | 0.747 | 0.715 | 0.765 | 0.739 | **0.823** | 0.795 | `learning_rate=0.05, max_depth=5, max_iter=100` |
+| Red neuronal (TensorFlow) | 0.720 | 0.692 | 0.728 | 0.710 | 0.809 | 0.787 | `hidden_units=(32,16), learning_rate=0.001` |
+| Regresión logística (baseline) | 0.718 | 0.693 | 0.719 | 0.706 | 0.791 | 0.744 | `C=10.0` |
+
+El orden entre los tres modelos no cambió respecto a la corrida sin tuning,
+y el ganador sigue superando claramente al baseline (0.823 vs. 0.791). El
+tuning aportó una mejora modesta pero real en las tres métricas de ROC-AUC
+frente a los hiperparámetros fijos anteriores, y sobre todo reemplazó
+parámetros elegidos a mano por parámetros elegidos con evidencia. Se guardó
+Hist Gradient Boosting en `models/churn_model.joblib`.
 
 **Nota sobre reproducibilidad temporal:** `churn_dataset.py` usa la fecha
 actual como corte para decidir qué ciclos están `censurado` vs. ya resueltos,
