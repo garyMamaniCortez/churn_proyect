@@ -5,3 +5,4 @@
 /churn_ciclos.csv
 /comparacion_modelos_churn.csv
 /predicciones_churn.csv
+/cv_final_detalle_por_fold.csv

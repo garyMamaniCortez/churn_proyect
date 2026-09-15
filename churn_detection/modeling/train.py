@@ -21,9 +21,12 @@ Design notes (SOLID)
 
 from __future__ import annotations
 
+import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.ensemble import HistGradientBoostingClassifier
@@ -37,7 +40,7 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import GridSearchCV, GroupKFold, GroupShuffleSplit
+from sklearn.model_selection import GridSearchCV, StratifiedGroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
 
@@ -83,7 +86,17 @@ class ChurnSplit:
 
 
 class GroupAwareSplitter:
-    """Train/test split grouped by persona_id, so no client's cycles straddle both sides."""
+    """Train/test split grouped by persona_id (no client's cycles straddle
+    both sides) AND approximately stratified by churn_label.
+
+    Plain `GroupShuffleSplit` only respects the group constraint; with a
+    churn rate that is rarely 50/50, a single random group-level shuffle can
+    still leave train and test with meaningfully different churn rates,
+    which quietly makes reported test metrics harder to compare across
+    runs/candidates. `StratifiedGroupKFold` keeps both constraints at once
+    (a client's cycles never split across folds, class balance preserved per
+    fold); we just take one of its folds as the held-out test set.
+    """
 
     def __init__(self, test_size: float = 0.25, random_state: int = 42) -> None:
         self._test_size = test_size
@@ -91,10 +104,14 @@ class GroupAwareSplitter:
 
     def split(self, df: pd.DataFrame, feature_columns: list[str]) -> ChurnSplit:
         labeled = df.dropna(subset=["churn_label"]).reset_index(drop=True)
-        splitter = GroupShuffleSplit(
-            n_splits=1, test_size=self._test_size, random_state=self._random_state
+        y = labeled["churn_label"].astype(int)
+
+        # e.g. test_size=0.25 -> 4 folds, each ~25% of the data as "test".
+        n_splits = max(2, round(1 / self._test_size))
+        splitter = StratifiedGroupKFold(
+            n_splits=n_splits, shuffle=True, random_state=self._random_state
         )
-        train_idx, test_idx = next(splitter.split(labeled, groups=labeled["persona_id"]))
+        train_idx, test_idx = next(splitter.split(labeled, y, groups=labeled["persona_id"]))
         train, test = labeled.iloc[train_idx], labeled.iloc[test_idx]
         return ChurnSplit(
             X_train=train[feature_columns],
@@ -110,6 +127,10 @@ class ChurnModelCandidate(ABC):
     declare its own hyperparameter search space."""
 
     name: str
+    # GridSearchCV parallelism for this candidate's own hyperparameter search.
+    # -1 (all cores) by default; a candidate overrides this only if it has a
+    # concrete reason not to parallelize (see NeuralNetworkCandidate).
+    n_jobs: int = -1
 
     @abstractmethod
     def build_pipeline(self) -> Pipeline: ...
@@ -123,32 +144,36 @@ class ChurnModelCandidate(ABC):
 
 
 class HyperparameterTuner:
-    """Grid search with group-aware cross-validation, by persona_id.
+    """Grid search with group-aware, class-stratified cross-validation.
 
-    Same concern as `GroupAwareSplitter`, one level down: if a client's cycles
-    could land in different CV folds, a hyperparameter choice could look good
-    only because the model partly memorized that specific client, not because
-    it generalizes. `GroupKFold` guarantees every one of a client's cycles
-    stays in a single fold.
-
-    `n_jobs=1` on purpose: `GridSearchCV`'s default joblib backend forks/pickles
-    the estimator to worker processes, and one candidate wraps a live
-    TensorFlow model -- not worth the risk of a multiprocessing/TF interaction
-    bug for a search space this small.
+    Same concern as `GroupAwareSplitter`, one level down: if a client's
+    cycles could land in different CV folds, a hyperparameter choice could
+    look good only because the model partly memorized that specific client,
+    not because it generalizes. `StratifiedGroupKFold` guarantees every one
+    of a client's cycles stays in a single fold AND keeps the churn rate
+    similar across folds, so a fold's score isn't noisy just because it
+    happened to get an unusually easy/hard class mix.
     """
 
-    def __init__(self, n_splits: int = 3, scoring: str = "roc_auc") -> None:
+    def __init__(
+        self, n_splits: int = 3, scoring: str = "roc_auc", random_state: int = 42
+    ) -> None:
         self._n_splits = n_splits
         self._scoring = scoring
+        self._random_state = random_state
 
-    def tune(self, pipeline: Pipeline, param_grid: dict, X, y, groups) -> tuple[Pipeline, dict]:
+    def tune(
+        self, pipeline: Pipeline, param_grid: dict, X, y, groups, n_jobs: int = -1
+    ) -> tuple[Pipeline, dict]:
         if not param_grid:
             pipeline.fit(X, y)
             return pipeline, {}
 
-        cv = GroupKFold(n_splits=self._n_splits)
+        cv = StratifiedGroupKFold(
+            n_splits=self._n_splits, shuffle=True, random_state=self._random_state
+        )
         search = GridSearchCV(
-            pipeline, param_grid, scoring=self._scoring, cv=cv, n_jobs=1, refit=True
+            pipeline, param_grid, scoring=self._scoring, cv=cv, n_jobs=n_jobs, refit=True
         )
         search.fit(X, y, groups=groups)
         return search.best_estimator_, search.best_params_
@@ -167,8 +192,6 @@ class _Log1pSkewedColumns:
         self._skewed_idx = skewed_idx
 
     def __call__(self, X):
-        import numpy as np
-
         X = np.asarray(X, dtype=float).copy()
         X[:, self._skewed_idx] = np.log1p(np.clip(X[:, self._skewed_idx], 0, None))
         return X
@@ -221,18 +244,42 @@ class KerasBinaryClassifier(ClassifierMixin, BaseEstimator):
         return model
 
     def fit(self, X, y):
-        import numpy as np
+        import tensorflow as tf
+
+        # Seed every source of randomness involved (Python/NumPy for data
+        # shuffling and weight init helpers, TF for the graph itself) so a
+        # run with the same hyperparameters is actually reproducible.
+        random.seed(self.random_state)
+        np.random.seed(self.random_state)
+        tf.random.set_seed(self.random_state)
 
         X = np.asarray(X, dtype="float32")
         y = np.asarray(y, dtype="float32")
         self.classes_ = np.array([0, 1])
         self._model = self._build_model(X.shape[1])
-        self._model.fit(X, y, epochs=self.epochs, batch_size=self.batch_size, verbose=0)
+
+        # A fixed epoch count with no monitoring risks over/underfitting
+        # depending on the learning rate picked by the grid search. Early
+        # stopping on a held-out slice of the training data (val_loss, not a
+        # named metric, so this doesn't depend on Keras's internal metric
+        # naming) fixes that without needing to hand-tune epochs per config.
+        callbacks = [
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_loss", mode="min", patience=5, restore_best_weights=True
+            )
+        ]
+        self._model.fit(
+            X,
+            y,
+            epochs=self.epochs,
+            batch_size=self.batch_size,
+            validation_split=0.15,
+            callbacks=callbacks,
+            verbose=0,
+        )
         return self
 
     def predict_proba(self, X):
-        import numpy as np
-
         X = np.asarray(X, dtype="float32")
         p1 = self._model.predict(X, verbose=0).reshape(-1)
         return np.column_stack([1 - p1, p1])
@@ -284,6 +331,12 @@ class NeuralNetworkCandidate(ChurnModelCandidate):
     descent on unscaled/skewed inputs converges poorly) and can't take NaN."""
 
     name = "neural_network"
+    # GridSearchCV's default joblib backend forks/pickles the estimator to
+    # worker processes; this candidate wraps a live TensorFlow model, so
+    # multiprocessing + TF is a known source of subtle hangs/crashes. Not
+    # worth the risk for a search space this small -- the other candidates
+    # keep their full parallelism (n_jobs=-1 from the base class).
+    n_jobs = 1
 
     def build_pipeline(self) -> Pipeline:
         skewed_idx = [FEATURE_COLUMNS.index(c) for c in SKEWED_FEATURES]
@@ -301,7 +354,7 @@ class NeuralNetworkCandidate(ChurnModelCandidate):
         # for every CV fold, and unlike the other two candidates this one has
         # no cheap way to skip redundant work. hidden_units controls capacity,
         # learning_rate controls how well gradient descent actually converges
-        # in the fixed 40 epochs -- the two knobs most likely to matter here.
+        # within `epochs` -- the two knobs most likely to matter here.
         return {
             "model__hidden_units": [(32, 16), (16, 8)],
             "model__learning_rate": [1e-3, 1e-2],
@@ -373,7 +426,7 @@ class ModelEvaluator:
         }
 
 
-def plot_confusion_matrix(pipeline, X_test, y_test, model_name: str, output_path) -> object:
+def plot_confusion_matrix(pipeline, X_test, y_test, model_name: str, output_path: Path) -> Path:
     """Saves a confusion matrix for `pipeline` on the held-out test set."""
     import matplotlib.pyplot as plt
     from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
@@ -391,7 +444,7 @@ def plot_confusion_matrix(pipeline, X_test, y_test, model_name: str, output_path
     return output_path
 
 
-def plot_feature_importance(pipeline, X_test, y_test, model_name: str, output_path):
+def plot_feature_importance(pipeline, X_test, y_test, model_name: str, output_path: Path) -> Path:
     """Saves a feature-importance bar chart for `pipeline`.
 
     Uses, in order of preference: `feature_importances_` (tree impurity-based,
@@ -402,7 +455,6 @@ def plot_feature_importance(pipeline, X_test, y_test, model_name: str, output_pa
     regardless of which candidate wins the comparison.
     """
     import matplotlib.pyplot as plt
-    import numpy as np
 
     model = pipeline.named_steps["model"]
     if hasattr(model, "feature_importances_"):
@@ -436,8 +488,6 @@ def plot_feature_importance(pipeline, X_test, y_test, model_name: str, output_pa
 # --- CLI ---
 
 if __name__ == "__main__":
-    from pathlib import Path
-
     import typer
 
     from churn_detection.config import (
@@ -463,15 +513,20 @@ if __name__ == "__main__":
         import matplotlib
 
         matplotlib.use("Agg")
-        from loguru import logger
         import matplotlib.pyplot as plt
         import mlflow
         import mlflow.sklearn
+        from loguru import logger
         from sklearn.metrics import roc_curve
 
         df = pd.read_csv(input_path)
         split = GroupAwareSplitter().split(df, FEATURE_COLUMNS)
-        logger.info(f"Train: {len(split.X_train)} ciclos. Test: {len(split.X_test)} ciclos.")
+        train_rate = split.y_train.mean()
+        test_rate = split.y_test.mean()
+        logger.info(
+            f"Train: {len(split.X_train)} ciclos (churn={train_rate:.1%}). "
+            f"Test: {len(split.X_test)} ciclos (churn={test_rate:.1%})."
+        )
 
         mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
         mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
@@ -490,12 +545,10 @@ if __name__ == "__main__":
         for candidate in candidates:
             with mlflow.start_run(run_name=candidate.name):
                 grid = candidate.param_grid()
-                import numpy as np
-
                 n_combos = int(np.prod([len(v) for v in grid.values()])) if grid else 1
                 logger.info(
                     f"{candidate.name}: probando {n_combos} combinaciones de hiperparámetros "
-                    f"con GroupKFold(n_splits={cv_splits})..."
+                    f"con StratifiedGroupKFold(n_splits={cv_splits}), n_jobs={candidate.n_jobs}..."
                 )
                 pipeline, best_params = tuner.tune(
                     candidate.build_pipeline(),
@@ -503,6 +556,7 @@ if __name__ == "__main__":
                     split.X_train,
                     split.y_train,
                     split.groups_train,
+                    n_jobs=candidate.n_jobs,
                 )
                 y_pred = pipeline.predict(split.X_test)
                 y_proba = pipeline.predict_proba(split.X_test)[:, 1]
@@ -519,7 +573,9 @@ if __name__ == "__main__":
                     }
                 )
                 mlflow.log_metrics(metrics)
-                mlflow.sklearn.log_model(pipeline, name="model", serialization_format="pickle")
+                mlflow.sklearn.log_model(
+                    pipeline, artifact_path="model", serialization_format="pickle"
+                )
 
                 results.append(
                     {
