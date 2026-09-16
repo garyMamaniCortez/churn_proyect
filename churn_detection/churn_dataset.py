@@ -228,9 +228,17 @@ class ChurnCycleDatasetBuilder:
         feats["tenure_dias"] = (
             (cutoff - ciclos_upto["fecha_inicio"].min()).days if len(ciclos_upto) else 0
         )
-        capped = ciclos_upto["ingresos_disponibles"].clip(upper=ciclos_upto["numero_ingresos"])
-        pct_uso = 1 - (capped / ciclos_upto["numero_ingresos"])
-        feats["porcentaje_uso_membresia"] = pct_uso.mean() if len(ciclos_upto) else np.nan
+        ciclos_uso_confiable = ciclos_upto[
+            ciclos_upto["fecha_inicio"] >= RELIABLE_ACCESS_TRACKING_SINCE
+        ]
+        if len(ciclos_uso_confiable):
+            capped = ciclos_uso_confiable["ingresos_disponibles"].clip(
+                upper=ciclos_uso_confiable["numero_ingresos"]
+            )
+            pct_uso = 1 - (capped / ciclos_uso_confiable["numero_ingresos"])
+            feats["porcentaje_uso_membresia"] = pct_uso.mean()
+        else:
+            feats["porcentaje_uso_membresia"] = np.nan
 
         return feats
 
