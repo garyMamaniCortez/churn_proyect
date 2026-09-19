@@ -143,6 +143,21 @@ class ChurnModelCandidate(ABC):
         return {}
 
 
+# Mismas 6 métricas que ModelEvaluator.evaluate produce sobre el test set,
+# expresadas como scorers de sklearn para que GridSearchCV las calcule en
+# cada fold del CV. Los nombres de la izquierda (las keys) son intencionalmente
+# los mismos que las keys de ModelEvaluator.evaluate, para poder comparar
+# "cv_mean_X" / "cv_std_X" contra "X" (test) fila por fila sin renombrar nada.
+CV_SCORING = {
+    "accuracy": "accuracy",
+    "precision": "precision",
+    "recall": "recall",
+    "f1": "f1",
+    "roc_auc": "roc_auc",
+    "pr_auc": "average_precision",
+}
+
+
 class HyperparameterTuner:
     """Grid search with group-aware, class-stratified cross-validation.
 
@@ -164,19 +179,46 @@ class HyperparameterTuner:
 
     def tune(
         self, pipeline: Pipeline, param_grid: dict, X, y, groups, n_jobs: int = -1
-    ) -> tuple[Pipeline, dict]:
+    ) -> tuple[Pipeline, dict, dict]:
+        """Returns (best_estimator, best_params, cv_metrics).
+
+        `cv_metrics` holds the mean AND standard deviation, across the CV
+        folds, of *all six* metrics in `CV_SCORING` -- not just the one
+        (`self._scoring`) used to rank/refit -- for the winning
+        hyperparameter combination only
+        (`GridSearchCV.cv_results_["mean_test_<metric>"]` /
+        `["std_test_<metric>"]` at `best_index_`). This is what tells you
+        whether the best score was a stable improvement across folds or a
+        lucky split -- a high mean with a high std is a red flag that raw
+        ranking alone hides -- and it lets you sanity-check the winner on
+        every metric, not just the one it was optimized for.
+        """
         if not param_grid:
             pipeline.fit(X, y)
-            return pipeline, {}
+            return pipeline, {}, {}
 
         cv = StratifiedGroupKFold(
             n_splits=self._n_splits, shuffle=True, random_state=self._random_state
         )
         search = GridSearchCV(
-            pipeline, param_grid, scoring=self._scoring, cv=cv, n_jobs=n_jobs, refit=True
+            pipeline,
+            param_grid,
+            scoring=CV_SCORING,
+            refit=self._scoring,
+            cv=cv,
+            n_jobs=n_jobs,
         )
         search.fit(X, y, groups=groups)
-        return search.best_estimator_, search.best_params_
+        best_idx = search.best_index_
+        cv_metrics = {}
+        for metric_name in CV_SCORING:
+            cv_metrics[f"cv_mean_{metric_name}"] = float(
+                search.cv_results_[f"mean_test_{metric_name}"][best_idx]
+            )
+            cv_metrics[f"cv_std_{metric_name}"] = float(
+                search.cv_results_[f"std_test_{metric_name}"][best_idx]
+            )
+        return search.best_estimator_, search.best_params_, cv_metrics
 
 
 class _Log1pSkewedColumns:
@@ -505,6 +547,7 @@ if __name__ == "__main__":
         input_path: Path = PROCESSED_DATA_DIR / "churn_ciclos.csv",
         model_output_path: Path = MODELS_DIR / "churn_model.joblib",
         comparison_path: Path = PROCESSED_DATA_DIR / "comparacion_modelos_churn.csv",
+        tuning_metrics_path: Path = PROCESSED_DATA_DIR / "metricas_tuning_ganador.csv",
         figure_path: Path = FIGURES_DIR / "07_curvas_roc.png",
         selection_metric: str = "roc_auc",
         cv_splits: int = 3,
@@ -536,28 +579,20 @@ if __name__ == "__main__":
             HistGradientBoostingCandidate(),
             NeuralNetworkCandidate(),
         ]
-        tuner = HyperparameterTuner(n_splits=cv_splits)
 
+        # --- Fase 1: entrenamiento base de los 3 candidatos (sin tuning) ---
+        # Cada candidato se entrena UNA vez con sus hiperparámetros por
+        # defecto -- esto es solo para elegir al ganador por
+        # `selection_metric`. El tuning (Fase 2) es demasiado costoso
+        # (GridSearchCV x StratifiedGroupKFold) para correrlo en los 3.
         results = []
-        fitted_pipelines = {}
         fig, ax = plt.subplots(figsize=(7, 6))
 
         for candidate in candidates:
-            with mlflow.start_run(run_name=candidate.name):
-                grid = candidate.param_grid()
-                n_combos = int(np.prod([len(v) for v in grid.values()])) if grid else 1
-                logger.info(
-                    f"{candidate.name}: probando {n_combos} combinaciones de hiperparámetros "
-                    f"con StratifiedGroupKFold(n_splits={cv_splits}), n_jobs={candidate.n_jobs}..."
-                )
-                pipeline, best_params = tuner.tune(
-                    candidate.build_pipeline(),
-                    grid,
-                    split.X_train,
-                    split.y_train,
-                    split.groups_train,
-                    n_jobs=candidate.n_jobs,
-                )
+            with mlflow.start_run(run_name=f"{candidate.name}_entrenamiento"):
+                logger.info(f"{candidate.name}: entrenamiento base (sin tuning)...")
+                pipeline = candidate.build_pipeline()
+                pipeline.fit(split.X_train, split.y_train)
                 y_pred = pipeline.predict(split.X_test)
                 y_proba = pipeline.predict_proba(split.X_test)[:, 1]
                 metrics = ModelEvaluator.evaluate(split.y_test, y_pred, y_proba)
@@ -565,11 +600,10 @@ if __name__ == "__main__":
                 mlflow.log_params(
                     {
                         "model": candidate.name,
+                        "stage": "entrenamiento",
                         "n_train": len(split.X_train),
                         "n_test": len(split.X_test),
                         "n_features": len(FEATURE_COLUMNS),
-                        "cv_splits": cv_splits,
-                        **best_params,
                     }
                 )
                 mlflow.log_metrics(metrics)
@@ -577,23 +611,16 @@ if __name__ == "__main__":
                     pipeline, artifact_path="model", serialization_format="pickle"
                 )
 
-                results.append(
-                    {
-                        "modelo": candidate.name,
-                        **metrics,
-                        "mejores_hiperparametros": best_params,
-                    }
-                )
-                fitted_pipelines[candidate.name] = pipeline
+                results.append({"modelo": candidate.name, **metrics})
+                logger.success(f"{candidate.name} (entrenamiento): {metrics}")
 
-                fpr, tpr, _ = roc_curve(split.y_test, y_proba)
-                ax.plot(fpr, tpr, label=f"{candidate.name} (AUC={metrics['roc_auc']:.3f})")
-                logger.success(f"{candidate.name}: {metrics} | mejores params: {best_params}")
+            fpr, tpr, _ = roc_curve(split.y_test, y_proba)
+            ax.plot(fpr, tpr, label=f"{candidate.name} (AUC={metrics['roc_auc']:.3f})")
 
         ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Azar")
         ax.set_xlabel("Tasa de falsos positivos")
         ax.set_ylabel("Tasa de verdaderos positivos")
-        ax.set_title("Curvas ROC por modelo (test set)")
+        ax.set_title("Curvas ROC por modelo — entrenamiento base (test set)")
         ax.legend()
         figure_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(figure_path, dpi=150, bbox_inches="tight")
@@ -603,10 +630,81 @@ if __name__ == "__main__":
         comparison = pd.DataFrame(results).sort_values(selection_metric, ascending=False)
         comparison_path.parent.mkdir(parents=True, exist_ok=True)
         comparison.to_csv(comparison_path, index=False)
-        logger.info(f"Comparación de modelos:\n{comparison}")
+        logger.info(f"Comparación de modelos (entrenamiento base):\n{comparison}")
 
         best_name = comparison.iloc[0]["modelo"]
-        best_pipeline = fitted_pipelines[best_name]
+        winner = next(c for c in candidates if c.name == best_name)
+        logger.info(f"Modelo ganador por {selection_metric}: {best_name}")
+
+        # --- Fase 2: tuning de hiperparámetros SOLO del modelo ganador ---
+        tuner = HyperparameterTuner(n_splits=cv_splits, scoring=selection_metric)
+        grid = winner.param_grid()
+        n_combos = int(np.prod([len(v) for v in grid.values()])) if grid else 1
+        logger.info(
+            f"{best_name}: probando {n_combos} combinaciones de hiperparámetros "
+            f"con StratifiedGroupKFold(n_splits={cv_splits}), n_jobs={winner.n_jobs}..."
+        )
+
+        with mlflow.start_run(run_name=f"{best_name}_tuning"):
+            best_pipeline, best_params, cv_metrics = tuner.tune(
+                winner.build_pipeline(),
+                grid,
+                split.X_train,
+                split.y_train,
+                split.groups_train,
+                n_jobs=winner.n_jobs,
+            )
+
+            y_pred = best_pipeline.predict(split.X_test)
+            y_proba = best_pipeline.predict_proba(split.X_test)[:, 1]
+            tuned_metrics = ModelEvaluator.evaluate(split.y_test, y_pred, y_proba)
+
+            mlflow.log_params(
+                {
+                    "model": best_name,
+                    "stage": "tuning",
+                    "n_train": len(split.X_train),
+                    "n_test": len(split.X_test),
+                    "n_features": len(FEATURE_COLUMNS),
+                    "cv_splits": cv_splits,
+                    "n_combinaciones": n_combos,
+                    "scoring": selection_metric,
+                    **best_params,
+                }
+            )
+            # Métricas del tuning: media y desviación estándar de las 6
+            # métricas (CV_SCORING) a través de los folds del GridSearchCV,
+            # para la mejor combinación de hiperparámetros encontrada.
+            mlflow.log_metrics(cv_metrics)
+            # Métricas del modelo ya afinado, evaluado en el test set
+            # held-out (el "entrenamiento" final, comparable con la Fase 1).
+            mlflow.log_metrics(tuned_metrics)
+            mlflow.sklearn.log_model(
+                best_pipeline, artifact_path="model", serialization_format="pickle"
+            )
+
+            # Misma idea que la tabla "comparison" de la Fase 1, pero acá
+            # una fila por métrica: media y desviación del CV al lado del
+            # valor final en el test set, para el modelo ganador afinado.
+            tuning_metrics = pd.DataFrame(
+                {
+                    "metrica": list(CV_SCORING.keys()),
+                    "cv_mean": [cv_metrics[f"cv_mean_{m}"] for m in CV_SCORING],
+                    "cv_std": [cv_metrics[f"cv_std_{m}"] for m in CV_SCORING],
+                    "test": [tuned_metrics[m] for m in CV_SCORING],
+                }
+            )
+            tuning_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            tuning_metrics.to_csv(tuning_metrics_path, index=False)
+            logger.info(
+                f"Métricas de tuning ({best_name}) — CV (media/desviación) vs. "
+                f"test:\n{tuning_metrics}"
+            )
+
+            logger.success(
+                f"{best_name} (tuning): mejores params={best_params}"
+            )
+
         model_output_path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(best_pipeline, model_output_path)
         logger.success(
