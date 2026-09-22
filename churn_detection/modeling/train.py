@@ -1040,9 +1040,12 @@ if __name__ == "__main__":
         # (n_splits=cv_splits) SOLO sobre el train set. El ganador se decide
         # con `cv_mean_{selection_metric}` -- nunca con el test set, para no
         # contaminar la única evaluación que queda para reportar desempeño
-        # final honesto. Cada candidato también se ajusta una vez sobre todo
-        # el train set y se evalúa en test aquí, pero solo para la curva ROC
-        # comparativa y la tabla descriptiva -- no participa en la elección.
+        # final honesto. La curva ROC comparativa también se dibuja con
+        # probabilidades out-of-fold de esa misma validación cruzada, no con
+        # el test set. Cada candidato además se ajusta una vez sobre todo el
+        # train set y se evalúa en test aquí, pero solo para la tabla
+        # descriptiva ("test_..." en comparacion_modelos_churn.csv y MLflow)
+        # -- no participa en la elección ni en la figura.
         results = []
         cv_summaries_raw: dict[str, dict[str, float]] = {}
         fig, ax = plt.subplots(figsize=(7, 6))
@@ -1057,6 +1060,17 @@ if __name__ == "__main__":
                     candidate, split.X_train, split.y_train, split.groups_train, cv_splits
                 )
                 cv_summary = _humanize_cv_summary(cv_summary_raw)
+
+                oof_cv = StratifiedGroupKFold(n_splits=cv_splits, shuffle=True, random_state=42)
+                oof_proba = cross_val_predict(
+                    candidate.build_pipeline(),
+                    split.X_train,
+                    split.y_train,
+                    groups=split.groups_train,
+                    cv=oof_cv,
+                    method="predict_proba",
+                    n_jobs=candidate.n_jobs,
+                )[:, 1]
 
                 pipeline = candidate.build_pipeline()
                 pipeline.fit(split.X_train, split.y_train)
@@ -1090,13 +1104,15 @@ if __name__ == "__main__":
                 )
                 cv_summaries_raw[candidate.name] = cv_summary_raw
 
-            fpr, tpr, _ = roc_curve(split.y_test, y_proba)
-            ax.plot(fpr, tpr, label=f"{candidate.name} (AUC={test_metrics['roc_auc']:.3f})")
+            fpr, tpr, _ = roc_curve(split.y_train, oof_proba)
+            ax.plot(
+                fpr, tpr, label=f"{candidate.name} (AUC={cv_summary['cv_mean_roc_auc']:.3f})"
+            )
 
         ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Azar")
         ax.set_xlabel("Tasa de falsos positivos")
         ax.set_ylabel("Tasa de verdaderos positivos")
-        ax.set_title("Curvas ROC por modelo — ajuste sobre train, evaluado en test")
+        ax.set_title("Curvas ROC por modelo — validación cruzada sobre el conjunto de entrenamiento")
         ax.legend()
         figure_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(figure_path, dpi=150, bbox_inches="tight")
@@ -1253,14 +1269,18 @@ if __name__ == "__main__":
             split.y_test, y_pred_calibrated, y_proba_calibrated
         )
         logger.info(
-            f"Calibración y umbral en test. Antes (umbral 0.5, sin calibrar): "
-            f"brier={tuned_metrics_raw['brier_score']:.4f}, "
+            f"Calibración y umbral en test. Antes (umbral 0.5, sin calibrar): \n"
+            f"precision={tuned_metrics_raw['precision']:.4f}, "
+            f"recall={tuned_metrics_raw['recall']:.4f}, "
             f"log_loss={tuned_metrics_raw['log_loss']:.4f}, "
-            f"f1={tuned_metrics_raw['f1']:.4f}. "
-            f"Después (umbral {threshold:.4f}, calibrado con {calibration_method}): "
-            f"brier={tuned_metrics_calibrated['brier_score']:.4f}, "
+            f"brier={tuned_metrics_raw['brier_score']:.4f}, "
+            f"f1={tuned_metrics_raw['f1']:.4f}. \n"
+            f"Después (umbral {threshold:.4f}, calibrado con {calibration_method}): \n"
+            f"precision={tuned_metrics_calibrated['precision']:.4f}, "
+            f"recall={tuned_metrics_calibrated['recall']:.4f}, "
             f"log_loss={tuned_metrics_calibrated['log_loss']:.4f}, "
-            f"f1={tuned_metrics_calibrated['f1']:.4f}. "
+            f"brier={tuned_metrics_calibrated['brier_score']:.4f}, "
+            f"f1={tuned_metrics_calibrated['f1']:.4f}. \n"
             "roc_auc y pr_auc no deberían cambiar por la calibración, ya que ambos métodos "
             "son monótonos, pero sí pueden cambiar por el nuevo umbral en las métricas que "
             "dependen de una clasificación dura."
@@ -1316,7 +1336,14 @@ if __name__ == "__main__":
             split.X_test,
             split.y_test,
             best_name,
-            _figpath / "12_matriz_confusion.png",
+            _figpath / "12_matriz_confusion_sin_calibrar.png",
+        )
+        cm_path = plot_confusion_matrix(
+            calibrated_model,
+            split.X_test,
+            split.y_test,
+            best_name,
+            _figpath / "13_matriz_confusion_calibrada.png",
         )
         logger.success(f"Wrote {cm_path}")
         fi_path = plot_feature_importance(
@@ -1324,7 +1351,7 @@ if __name__ == "__main__":
             split.X_test,
             split.y_test,
             best_name,
-            _figpath / "13_importancia_features.png",
+            _figpath / "14_importancia_features.png",
         )
         logger.success(f"Wrote {fi_path}")
 
