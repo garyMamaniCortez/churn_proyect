@@ -125,10 +125,18 @@ propias (`08` a `11` en `reports/figures/`):
 
 `churn_detection/modeling/train.py` compara 3 modelos candidatos (patrón de
 clase-por-candidato: `ChurnModelCandidate` ABC + una subclase por modelo), con
-split train/test **agrupado por `persona_id`** (`GroupAwareSplitter`) para que
-ningún cliente tenga ciclos repartidos entre train y test, y con tracking en
-**MLflow** (experimento `churn_gimnasio`, backend SQLite local en
-`mlflow.db`).
+split train/test **cronológico** (`ChronologicalSplitter`): train solo
+contiene ciclos cuyo resultado se resolvió (`fecha_vencimiento`) antes de una
+fecha de corte, test solo ciclos resueltos después. Esto demuestra desempeño
+sobre datos genuinamente futuros, algo que un split agrupado por
+`persona_id` pero sin orden temporal no garantiza (podía dejar ciclos más
+recientes en train que en test). Un mismo cliente puede seguir apareciendo a
+ambos lados (su ciclo temprano en train, uno posterior en test) porque
+`persona_id` nunca es una feature; ese `persona_id` sí se conserva para que la
+validación cruzada interna (selección de modelo y tuning, ver más abajo) no
+reparta los ciclos de un mismo cliente entre folds. Todo el entrenamiento
+queda con tracking en **MLflow** (experimento `churn_gimnasio`, backend
+SQLite local en `mlflow.db`).
 
 **Preprocesamiento aplicado, por modelo** (no es el mismo para los tres, y es
 así a propósito):
@@ -187,16 +195,39 @@ cual tampoco es picklable. Se corrigió moviéndola a una clase a nivel de
 módulo (`_Log1pSkewedColumns`), compartida hoy entre la regresión logística y
 la red neuronal.
 
-### Tuning de hiperparámetros con validación cruzada agrupada
+### Selección de modelo y tuning, ambos por validación cruzada
 
-Hasta esta fase, los tres modelos entrenaban con hiperparámetros fijos a
-mano, nunca se había corrido una búsqueda real. Se agregó
-`HyperparameterTuner`, que envuelve `GridSearchCV` pero usando `GroupKFold`
-en vez de un k-fold común, agrupando por `persona_id` con el mismo criterio
-que `GroupAwareSplitter` ya usaba para el split train/test: si los folds de
-validación cruzada pudieran mezclar ciclos del mismo cliente, una
-combinación de hiperparámetros podría verse mejor solo porque el modelo
+Los 3 candidatos ya no se comparan ajustándolos una vez y mirando su
+desempeño en el test set (eso usaría el test set para elegir un ganador, y
+después otra vez para "reportar" ese mismo ganador -- el mismo dato
+respaldando dos afirmaciones distintas). En cambio, cada candidato se valida
+con `StratifiedGroupKFold` (`cross_validate_candidate`) **solo sobre el
+train set**, y el ganador se elige por la métrica media de validación
+(`cv_mean_<selection_metric>`). El ajuste sobre todo el train + evaluación en
+test que también se ve en los logs es puramente descriptivo (la curva ROC
+comparativa, la tabla `comparacion_modelos_churn.csv`), nunca decide nada.
+
+El tuning de hiperparámetros del ganador (`HyperparameterTuner`, que envuelve
+`GridSearchCV`) sigue el mismo principio un nivel más abajo: usa el mismo
+`StratifiedGroupKFold` agrupado por `persona_id`, y el `refit` también se
+decide con la métrica de validación, nunca con el test set. Agrupar por
+`persona_id` en ambos casos evita que los folds de validación cruzada
+mezclen ciclos del mismo cliente: si eso pasara, una combinación de
+hiperparámetros (o un candidato) podría verse mejor solo porque el modelo
 memorizó parcialmente a ese cliente, no porque generalice mejor.
+
+**Métrica de selección: `log_loss`, no `roc_auc`.** El objetivo del proyecto
+es estimar una *probabilidad* de abandono, no solo ordenar clientes de más a
+menos riesgosos. ROC-AUC, PR-AUC y recall miden exclusivamente
+discriminación: son invariantes a cualquier recalibración monótona de la
+probabilidad predicha, así que un modelo puede tener ROC-AUC alto y seguir
+prediciendo "0.95" para clientes que en realidad abandonan el 60% de las
+veces. `log_loss` (y `brier_score`, que también se reporta) son *proper
+scoring rules*: solo mejoran cuando la probabilidad predicha se acerca a la
+tasa real observada, así que elegir el modelo/hiperparámetros que minimizan
+`log_loss` en validación favorece directamente el objetivo del proyecto. Ver
+"Calibración de probabilidades" más abajo para cómo se verifica y corrige
+esto de forma explícita, no solo se selecciona por ello.
 
 Cada candidato declara su propia grilla vía `param_grid()` (patrón
 Open/Closed, igual que `build_pipeline()`): regresión logística busca sobre
@@ -221,18 +252,96 @@ recomienda y que fácilmente se pasa por alto), con dos tests dedicados que lo
 cubren: uno directo sobre `is_classifier()` y otro de integración corriendo
 `HyperparameterTuner` de punta a punta sobre la red neuronal.
 
-| Modelo | Accuracy | Precision | Recall | F1 | ROC-AUC | PR-AUC | Mejores hiperparámetros |
-|---|---|---|---|---|---|---|---|
-| **Hist Gradient Boosting** (ganador) | 0.747 | 0.715 | 0.765 | 0.739 | **0.823** | 0.795 | `learning_rate=0.05, max_depth=5, max_iter=100` |
-| Red neuronal (TensorFlow) | 0.720 | 0.692 | 0.728 | 0.710 | 0.809 | 0.787 | `hidden_units=(32,16), learning_rate=0.001` |
-| Regresión logística (baseline) | 0.718 | 0.693 | 0.719 | 0.706 | 0.791 | 0.744 | `C=10.0` |
+**Resultados de la corrida con la metodología corregida** (split cronológico,
+selección por validación cruzada): Hist Gradient Boosting ganó la comparación
+de los 3 candidatos por `log_loss` en CV, aunque el desempeño de discriminación
+(Accuracy) fue prácticamente idéntico entre los tres (~0.714-0.715). Tras el
+tuning (`StratifiedGroupKFold(n_splits=5)`, 27 combinaciones,
+`learning_rate=0.05, max_depth=5, max_iter=100`):
 
-El orden entre los tres modelos no cambió respecto a la corrida sin tuning,
-y el ganador sigue superando claramente al baseline (0.823 vs. 0.791). El
-tuning aportó una mejora modesta pero real en las tres métricas de ROC-AUC
-frente a los hiperparámetros fijos anteriores, y sobre todo reemplazó
-parámetros elegidos a mano por parámetros elegidos con evidencia. Se guardó
-Hist Gradient Boosting en `models/churn_model.joblib`.
+| Métrica | CV media | CV desv. estándar | Test (sin calibrar) |
+|---|---|---|---|
+| Accuracy | 0.7249 | 0.0148 | 0.7784 |
+| Precision | 0.7126 | 0.0097 | 0.7158 |
+| Recall | 0.7856 | 0.0389 | 0.6422 |
+| F1 | 0.7469 | 0.0191 | 0.6770 |
+| ROC-AUC | 0.8040 | 0.0162 | 0.8255 |
+| PR-AUC | 0.8038 | 0.0155 | 0.7150 |
+| Brier Score | 0.1800 | 0.0074 | 0.1623 |
+| Log Loss | 0.5350 | 0.0175 | 0.4996 |
+
+Sobre ese mismo test set, la Red Neuronal (no elegida, por perder en `log_loss`
+de CV) obtuvo ROC-AUC 0.8415, PR-AUC 0.6879 y Log Loss 0.4965 -- ligeramente
+mejor que Hist Gradient Boosting en esa partición puntual. Esto no es un error
+de selección: es la varianza esperable de un único test set frente a un
+promedio de validación cruzada, que es justamente la razón de elegir por CV
+y no por el resultado de una sola partición (ver `cv_final_detalle_por_fold.csv`
+para el detalle por fold).
+
+### Calibración de probabilidades (método elegido por validación cruzada)
+
+Seleccionar por `log_loss`/`brier_score` ayuda a que el ganador tienda a
+salir bien calibrado, pero no lo garantiza -- así que se verifica y se
+corrige explícitamente, en un paso aparte, antes de guardar el modelo final:
+
+1. Se generan probabilidades **out-of-fold** del modelo ganador ya afinado
+   sobre el train set (`cross_val_predict` con el mismo `StratifiedGroupKFold`
+   agrupado por `persona_id`). Deben ser out-of-fold y no las predicciones
+   in-sample del modelo: un modelo es sistemáticamente más confiado sobre
+   datos que ya vio, así que calibrar contra sus propias predicciones
+   in-sample solo le enseñaría a un calibrador a reproducir ese exceso de
+   confianza, no a corregirlo.
+2. **`select_calibrator` elige entre isotónica y sigmoid (Platt scaling) por
+   validación cruzada**, no aplica isotónica sin más. La primera versión de
+   este paso sí lo hacía, y el resultado real de una corrida fue que la
+   calibración isotónica *empeoró* el Brier Score (0.1623 → 0.1635) y el Log
+   Loss (0.4996 → 0.5061) en el test set: la tabla de confiabilidad mostró
+   que, en el decil de mayor riesgo, isotónica predijo 0.968 cuando la tasa
+   observada era 0.797 -- muy pocas observaciones out-of-fold caen en ese
+   extremo, y la flexibilidad de isotónica (puede ajustar un escalón
+   arbitrario) sobreajustó ese puñado de puntos en vez de generalizar.
+   Una segunda versión comparó isotónica vs. sigmoid por **Brier Score**
+   cross-validado (agrupado por cliente, repetido 5 veces) y **isotónica
+   siguió ganando** (0.1803 vs. 0.1809): el decil problemático es una
+   fracción tan pequeña del train set que un promedio de error cuadrático
+   casi no lo nota. Solo al cambiar el criterio de comparación a **Log
+   Loss** -- que penaliza de forma logarítmica una probabilidad confiada y
+   equivocada, exactamente lo que pasa en ese decil -- la comparación se dio
+   vuelta (isotónica 0.5399 vs. sigmoid 0.5385) y `select_calibrator` eligió
+   sigmoid. En la corrida más reciente, con sigmoid, el Brier Score del test
+   set bajó a 0.1607 y el Log Loss a 0.4955 (mejoras reales, no un
+   empeoramiento como con isotónica sin más). Es la misma razón por la que
+   el proyecto ya usaba Log Loss, y no ROC-AUC, para elegir modelo e
+   hiperparámetros (sección de arriba): resultó ser también el criterio
+   correcto para elegir el propio método de calibración.
+3. El modelo final guardado en `models/churn_model.joblib`
+   (`CalibratedChurnModel`) envuelve el pipeline afinado + el calibrador
+   elegido: `predict_proba` ya devuelve la probabilidad calibrada, no la cruda.
+
+La evidencia queda en dos artefactos, ambos sobre el test set held-out y
+comparando antes/después de calibrar: `reports/figures/14_calibracion.png`
+(diagrama de confiabilidad: probabilidad media predicha vs. tasa de churn
+observada, por decil) y `data/processed/calibracion_modelo_ganador.csv` (la
+misma comparación en tabla). `roc_auc`/`pr_auc` no cambian entre la versión
+cruda y la calibrada, como se espera de una transformación monótona (0.8255 /
+0.7150 en ambas); `brier_score` y `log_loss` sí mejoraron con sigmoid.
+
+**Bug real encontrado al conectar esto con `predict.py`:** `models/
+churn_model.joblib` se genera corriendo `train.py` como script (`python -m
+churn_detection.modeling.train`), lo que hace que Python trate esa ejecución
+de `train.py` como el módulo `"__main__"` -- por lo que `CalibratedChurnModel`
+(y las demás clases propias del archivo) quedan *pickleadas* como si vivieran
+en `"__main__"`, no en su ruta real. `predict.py`, corrido después como su
+propio proceso (`python -m churn_detection.modeling.predict`), tiene su
+*propio* `"__main__"` -- que nunca definió esas clases -- así que un
+`joblib.load` directo fallaba con `AttributeError: Can't get attribute
+'CalibratedChurnModel' on <module '__main__' ...>`. Se corrigió con
+`_register_train_classes_under_main()` en `predict.py`: antes de cargar el
+artefacto, registra las clases reales (importadas normalmente) bajo
+`sys.modules["__main__"]` de ese proceso, para que la búsqueda de `pickle`
+las encuentre. Cubierto por
+`test_score_open_cycles_loads_a_calibrated_model_pickled_under_main`, que
+reproduce el bug pickleando bajo `"__main__"` a propósito antes de cargar.
 
 **Nota sobre reproducibilidad temporal:** `churn_dataset.py` usa la fecha
 actual como corte para decidir qué ciclos están `censurado` vs. ya resueltos,

@@ -31,9 +31,12 @@ stages:
     outs:
       - models/churn_model.joblib
       - data/processed/comparacion_modelos_churn.csv
+      - data/processed/metricas_tuning_ganador.csv
+      - data/processed/calibracion_modelo_ganador.csv
       - reports/figures/07_curvas_roc.png
       - reports/figures/12_matriz_confusion.png
       - reports/figures/13_importancia_features.png
+      - reports/figures/14_calibracion.png
 
   score_churn:
     cmd: python -m churn_detection.modeling.predict
