@@ -29,6 +29,39 @@ from churn_detection.modeling.train import (
 app = typer.Typer(help="Score open (unresolved) membership cycles with the trained churn model.")
 
 
+def _risk_bins(probabilidad_churn: pd.Series) -> tuple[list[float], list[str]]:
+    """Bin edges and labels for risk level, based on the TERCILES of this
+    batch's own distribution of estimated probabilities -- "alto" is the
+    riskiest third of the clients being scored right now, not a fixed point
+    on the 0-1 probability scale. A probability of 0.67 does not become
+    "riesgo alto" just because 0-1 was cut into three equal parts; it
+    becomes "riesgo alto" only if it is actually among the highest
+    predicted probabilities in the batch currently being scored. This means
+    the cutoffs are only meaningful for comparing clients within the same
+    run, which matches the deployment proposal already described in the
+    project's report: the retention team adjusts how far down the ranked
+    list it works based on its own contact capacity, not against a fixed
+    probability value.
+
+    Falls back to two levels (bajo/alto split at the median) if the batch's
+    probabilities are too concentrated for three distinct tercile edges
+    (e.g. a very small or near-uniform batch) -- `pd.cut` requires strictly
+    increasing edges, and silently coercing ties there would misclassify
+    rows rather than fail loudly.
+    """
+    low_cut, high_cut = probabilidad_churn.quantile([1 / 3, 2 / 3])
+    if low_cut < high_cut:
+        return [0.0, low_cut, high_cut, 1.0], ["bajo", "medio", "alto"]
+
+    logger.warning(
+        "Probabilidades del lote demasiado concentradas para terciles "
+        f"distintos (P33={low_cut:.4f}, P66={high_cut:.4f}); usando dos "
+        "niveles de riesgo en torno a la mediana en vez de tres."
+    )
+    median_cut = probabilidad_churn.median()
+    return [0.0, median_cut, 1.0], ["bajo", "alto"]
+
+
 def _register_train_classes_under_main() -> None:
     """`models/churn_model.joblib` is produced by running train.py as a
     script (`python -m churn_detection.modeling.train`, what dvc.yaml/
@@ -64,12 +97,11 @@ def score_open_cycles(
     _register_train_classes_under_main()
     pipeline = joblib.load(model_path)
     open_cycles["probabilidad_churn"] = pipeline.predict_proba(open_cycles[FEATURE_COLUMNS])[:, 1]
+    bins, labels = _risk_bins(open_cycles["probabilidad_churn"])
     open_cycles["riesgo"] = pd.cut(
-        open_cycles["probabilidad_churn"],
-        bins=[0, 0.33, 0.66, 1.0],
-        labels=["bajo", "medio", "alto"],
-        include_lowest=True,
+        open_cycles["probabilidad_churn"], bins=bins, labels=labels, include_lowest=True
     )
+    logger.info(f"Cortes de riesgo de esta corrida (terciles del lote puntuado): {bins}")
 
     output_cols = [
         "persona_id",

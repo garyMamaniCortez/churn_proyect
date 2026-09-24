@@ -1259,6 +1259,37 @@ if __name__ == "__main__":
             f"{threshold:.4f}"
         )
 
+        # Métricas promedio de validación cruzada del modelo YA calibrado: se
+        # reutilizan los mismos folds de calibration_cv que generaron
+        # oof_proba (StratifiedGroupKFold con el mismo random_state produce
+        # la misma partición), evaluando en cada fold con las probabilidades
+        # calibradas fuera de muestra y el umbral final. Es el mismo resumen
+        # (media y desviación estándar entre folds) que cross_validate_candidate
+        # y HyperparameterTuner ya reportan para elegir modelo e
+        # hiperparámetros, pero aplicado al pipeline calibrado completo en
+        # vez de al pipeline crudo.
+        oof_pred_calibrated = (oof_proba_calibrated >= threshold).astype(int)
+        cv_calibrated_folds: dict[str, list[float]] = {metric: [] for metric in CV_SCORING}
+        for _, val_idx in calibration_cv.split(
+            split.X_train, split.y_train, groups=split.groups_train
+        ):
+            fold_metrics = ModelEvaluator.evaluate(
+                split.y_train.iloc[val_idx],
+                oof_pred_calibrated[val_idx],
+                oof_proba_calibrated[val_idx],
+            )
+            for metric_name, value in fold_metrics.items():
+                cv_calibrated_folds[metric_name].append(value)
+        cv_calibrated_report = "\n".join(
+            f"  {metric_name}: {np.mean(values):.4f} (+/- {np.std(values):.4f})"
+            for metric_name, values in cv_calibrated_folds.items()
+        )
+        logger.success(
+            f"Métricas promedio de validación cruzada del modelo calibrado "
+            f"({best_name}, umbral {threshold:.4f}, calibrado con {calibration_method}):\n"
+            f"{cv_calibrated_report}"
+        )
+
         calibrated_model = CalibratedChurnModel(
             pipeline=best_pipeline, calibrator=calibrator, threshold=threshold
         )
@@ -1298,6 +1329,18 @@ if __name__ == "__main__":
             mlflow.log_metrics({f"cv_log_loss_{k}": v for k, v in calibration_cv_log_loss.items()})
             mlflow.log_metrics({f"sin_calibrar_{k}": v for k, v in tuned_metrics_raw.items()})
             mlflow.log_metrics({f"calibrado_{k}": v for k, v in tuned_metrics_calibrated.items()})
+            mlflow.log_metrics(
+                {
+                    f"cv_calibrado_mean_{k}": float(np.mean(v))
+                    for k, v in cv_calibrated_folds.items()
+                }
+            )
+            mlflow.log_metrics(
+                {
+                    f"cv_calibrado_std_{k}": float(np.std(v))
+                    for k, v in cv_calibrated_folds.items()
+                }
+            )
             mlflow.sklearn.log_model(
                 calibrated_model, artifact_path="model", serialization_format="pickle"
             )
