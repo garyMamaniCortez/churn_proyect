@@ -11,9 +11,28 @@ Design notes (SOLID)
   that finish later. A client can still appear on both sides (their early
   cycle in train, a later one in test): that is not leakage, it is the real
   sequence of events for a returning client, and `persona_id` is never a
-  feature. `persona_id` is still tracked (`groups_train`) so the internal
-  K-fold cross-validation used for model selection and hyperparameter
-  tuning never splits one client's cycles across two folds.
+  feature.
+- `WalkForwardGroupSplitter` extends that same time discipline one level
+  down, INSIDE the training split. Model selection, hyperparameter tuning,
+  probability calibration and threshold selection all cross-validate with
+  this splitter instead of a random (even if group-aware and stratified)
+  K-fold: fold i trains on everything up to calendar month M_i and
+  validates on month M_{i+1}, purging any client seen in the validation
+  month from that fold's training rows. A random K-fold would happily
+  validate an early month with a model partly trained on later months --
+  exactly the kind of leakage `ChronologicalSplitter` already prevents for
+  the outer test split, left unaddressed one level down. It matters
+  concretely because `RELIABLE_ACCESS_TRACKING_SINCE` (churn_detection/
+  config.py) is 2026-02-01: every check-in-derived feature is NaN before
+  that date from a real system outage, not from an actual absence of
+  visits, so a fold mixing pre/post-February cycles between train and
+  validation is being scored under a condition that could never happen in
+  production, where the model only ever looks backward from today.
+  `min_train_size` additionally skips any fold whose training window is
+  still too small to give a stable estimate -- this project's very first
+  windows (a single, mostly check-in-blind month) are exactly that, and a
+  handful of near-empty folds dragging the average around says more about
+  fold size than about the candidate being evaluated.
 - `ChurnModelCandidate` (ABC): each concrete candidate only knows how to build
   its own preprocessing + estimator `Pipeline`. Adding a new candidate model
   is one small class, not a change to the training loop (Open/Closed).
@@ -66,12 +85,7 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import (
-    GridSearchCV,
-    StratifiedGroupKFold,
-    cross_val_predict,
-    cross_validate,
-)
+from sklearn.model_selection import GridSearchCV, cross_validate
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
 
@@ -114,6 +128,7 @@ class ChurnSplit:
     y_train: pd.Series
     y_test: pd.Series
     groups_train: pd.Series
+    dates_train: pd.Series
     cutoff_date: pd.Timestamp
 
 
@@ -166,8 +181,105 @@ class ChronologicalSplitter:
             y_train=train["churn_label"].astype(int),
             y_test=test["churn_label"].astype(int),
             groups_train=train["persona_id"],
+            dates_train=train[self._date_column],
             cutoff_date=cutoff_date,
         )
+
+
+class WalkForwardGroupSplitter:
+    """Time-respecting cross-validator for everything that happens INSIDE the
+    training split: model selection, hyperparameter tuning, calibration and
+    threshold selection. See the module docstring for why this replaces a
+    random (even if group-aware, stratified) K-fold there.
+
+    Fold i trains on every row whose date falls at or before calendar month
+    M_i, and validates on the immediately following month, M_{i+1} -- an
+    expanding window, never a rolling one, so later folds simply have more
+    training history, exactly like a real retraining schedule would.
+
+    Any client who appears in a fold's validation month is purged entirely
+    from that fold's training rows (not just their cycle in that month --
+    every row of theirs up to that point), for the same reason this project
+    already groups by client everywhere else: a client's own earlier cycle
+    could otherwise leak information about their later, held-out one within
+    the same fold.
+
+    Validation windows with fewer than `min_val_size` rows are skipped --
+    too few observations for the fold's metric to mean much -- but their
+    rows still accumulate into the training set of whichever later fold
+    does qualify. Folds whose TRAINING window (after purging) has fewer than
+    `min_train_size` rows are skipped too, and this time the excluded rows
+    are simply never scored at all: a fold trained on a few hundred rows
+    from a single early month, where several features are entirely missing
+    (see the module docstring's note on RELIABLE_ACCESS_TRACKING_SINCE),
+    produces an unstable per-fold estimate for any candidate regardless of
+    how good it actually is, and it is more honest to exclude that fold
+    than to let it swing the average around. The very first month is never
+    a validation window either way: there is no earlier data a model could
+    have trained on to be validated against it, exactly mirroring that a
+    real model deployed at that point would have had nothing to learn from
+    yet.
+    """
+
+    def __init__(
+        self, dates: pd.Series, min_val_size: int = 100, min_train_size: int = 100
+    ) -> None:
+        self._dates = pd.to_datetime(pd.Series(dates).reset_index(drop=True))
+        self._min_val_size = min_val_size
+        self._min_train_size = min_train_size
+
+    def months(self) -> list[pd.Period]:
+        """Calendar months present in `dates`, sorted -- the first is never a
+        validation window (see class docstring), the rest are candidates for
+        one, subject to `min_val_size`/`min_train_size`."""
+        return sorted(self._dates.dt.to_period("M").unique())
+
+    def split(self, X=None, y=None, groups=None):
+        months = self._dates.dt.to_period("M")
+        groups_arr = pd.Series(groups).reset_index(drop=True) if groups is not None else None
+        windows = self.months()
+        for i in range(len(windows) - 1):
+            train_cutoff_month, val_month = windows[i], windows[i + 1]
+            val_mask = (months == val_month).to_numpy()
+            if val_mask.sum() < self._min_val_size:
+                continue
+            train_mask = (months <= train_cutoff_month).to_numpy()
+            if groups_arr is not None:
+                val_clients = set(groups_arr[val_mask])
+                train_mask = train_mask & ~groups_arr.isin(val_clients).to_numpy()
+            if train_mask.sum() < self._min_train_size:
+                continue
+            yield np.flatnonzero(train_mask), np.flatnonzero(val_mask)
+
+    def get_n_splits(self, X=None, y=None, groups=None) -> int:
+        return sum(1 for _ in self.split(X, y, groups))
+
+
+def walk_forward_oof_predict_proba(
+    estimator, X: pd.DataFrame, y: pd.Series, groups: pd.Series, cv: WalkForwardGroupSplitter
+) -> tuple[np.ndarray, np.ndarray]:
+    """Like `sklearn.model_selection.cross_val_predict(method="predict_proba")`,
+    but tolerant of a CV that does not cover every row -- which
+    `WalkForwardGroupSplitter` never does by construction, since its first
+    month (and any fold below `min_train_size`/`min_val_size`) is never a
+    validation window (see its docstring). sklearn's own `cross_val_predict`
+    requires full coverage and raises otherwise.
+
+    Returns `(oof_proba, covered)`: `oof_proba` has one entry per row of `X`,
+    `nan` for rows that never landed in a validation fold; `covered` flags
+    which rows are real out-of-fold predictions. Callers must restrict to
+    `covered` rows before using `oof_proba` for anything -- an uncovered row
+    was never actually validated against a model that didn't train on it.
+    """
+    n = len(X)
+    oof_proba = np.full(n, np.nan)
+    covered = np.zeros(n, dtype=bool)
+    for train_idx, val_idx in cv.split(X, y, groups=groups):
+        model = clone(estimator)
+        model.fit(X.iloc[train_idx], y.iloc[train_idx])
+        oof_proba[val_idx] = model.predict_proba(X.iloc[val_idx])[:, 1]
+        covered[val_idx] = True
+    return oof_proba, covered
 
 
 class ChurnModelCandidate(ABC):
@@ -183,7 +295,7 @@ class ChurnModelCandidate(ABC):
     @abstractmethod
     def build_pipeline(self) -> Pipeline: ...
 
-    def param_grid(self) -> dict:
+    def param_grid(self) -> dict | list[dict]:
         """Grid of pipeline-step-prefixed hyperparameters to search over (e.g.
         `{"model__C": [0.1, 1, 10]}`). Empty by default -- a candidate with
         nothing worth tuning just skips the search (Open/Closed: adding a
@@ -237,27 +349,22 @@ def _humanize_cv_summary(cv_summary: dict[str, float]) -> dict[str, float]:
 
 
 class HyperparameterTuner:
-    """Grid search with group-aware, class-stratified cross-validation.
+    """Grid search cross-validated with `cv` (see `WalkForwardGroupSplitter`).
 
-    Same concern as `ChronologicalSplitter`'s `groups_train`, one level down:
-    if a client's cycles could land in different CV folds, a hyperparameter
-    choice could look good only because the model partly memorized that
-    specific client, not because it generalizes. `StratifiedGroupKFold`
-    guarantees every one of a client's cycles stays in a single fold AND
-    keeps the churn rate similar across folds, so a fold's score isn't noisy
-    just because it happened to get an unusually easy/hard class mix.
+    Same concern as `WalkForwardGroupSplitter`'s client purging, one level
+    down: if a client's cycles could land in both the training and
+    validation portion of a fold, a hyperparameter choice could look good
+    only because the model partly memorized that specific client, not
+    because it generalizes.
 
     The winning hyperparameter combination is chosen entirely from these CV
     (validation) scores -- `X`/`y`/`groups` here must be the TRAINING split
     only, never the held-out test set.
     """
 
-    def __init__(
-        self, n_splits: int = 5, scoring: str = "log_loss", random_state: int = 42
-    ) -> None:
-        self._n_splits = n_splits
+    def __init__(self, cv: WalkForwardGroupSplitter, scoring: str = "log_loss") -> None:
+        self._cv = cv
         self._scoring = scoring
-        self._random_state = random_state
 
     def tune(
         self, pipeline: Pipeline, param_grid: dict, X, y, groups, n_jobs: int = -1
@@ -282,15 +389,12 @@ class HyperparameterTuner:
             pipeline.fit(X, y)
             return pipeline, {}, {}
 
-        cv = StratifiedGroupKFold(
-            n_splits=self._n_splits, shuffle=True, random_state=self._random_state
-        )
         search = GridSearchCV(
             pipeline,
             param_grid,
             scoring=CV_SCORING,
             refit=self._scoring,
-            cv=cv,
+            cv=self._cv,
             n_jobs=n_jobs,
         )
         search.fit(X, y, groups=groups)
@@ -469,7 +573,16 @@ class NeuralNetworkCandidate(ChurnModelCandidate):
         skewed_idx = [FEATURE_COLUMNS.index(c) for c in SKEWED_FEATURES]
         return Pipeline(
             [
-                ("imputer", SimpleImputer(strategy="median")),
+                # keep_empty_features=True: an early WalkForwardGroupSplitter
+                # fold can still have a column with zero non-missing values
+                # even after min_train_size filtering. SimpleImputer's default
+                # silently DROPS an all-NaN column instead of imputing it,
+                # which shifts every later column's position and breaks
+                # _Log1pSkewedColumns, whose indices are fixed positions in
+                # FEATURE_COLUMNS. Keeping the column (filled with 0, the
+                # documented fallback when there is no median to compute)
+                # keeps the column count and order stable across every fold.
+                ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
                 ("log1p_skewed", FunctionTransformer(_Log1pSkewedColumns(skewed_idx))),
                 ("scaler", StandardScaler()),
                 ("model", KerasBinaryClassifier()),
@@ -501,19 +614,55 @@ class LogisticRegressionCandidate(ChurnModelCandidate):
         skewed_idx = [FEATURE_COLUMNS.index(c) for c in SKEWED_FEATURES]
         return Pipeline(
             [
-                ("imputer", SimpleImputer(strategy="median")),
+                ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
                 ("log1p_skewed", FunctionTransformer(_Log1pSkewedColumns(skewed_idx))),
                 ("scaler", StandardScaler()),
-                ("model", LogisticRegression(max_iter=1000, random_state=42)),
+                # saga soporta l1/l2/elasticnet; liblinear (el default) solo
+                # soporta l2 y l1, no elasticnet, y no escala tan bien como
+                # saga cuando el grid crece.
+                ("model", LogisticRegression(max_iter=2000, random_state=42, solver="saga")),
             ]
         )
 
     def param_grid(self) -> dict:
-        # C is the inverse of the regularization strength: smaller values
-        # penalize large coefficients more heavily. This is the one
-        # hyperparameter that meaningfully changes a logistic regression's
-        # behavior on a dataset this size.
-        return {"model__C": [0.01, 0.1, 1.0, 10.0]}
+        # El tuning anterior eligio C=0.01, cerca del extremo mas regularizado
+        # de la grilla vieja (el minimo era 0.001) -- senal de que el optimo
+        # real podia estar mas alla del borde explorado. Se extiende el rango
+        # hacia C aun mas chicos (mas regularizacion) y se agregan puntos
+        # intermedios alrededor de la zona donde gano la corrida anterior,
+        # en vez de solo mover el limite.
+        c_values = [
+            0.0001,
+            0.0005,
+            0.001,
+            0.0025,
+            0.005,
+            0.0075,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.5,
+            1.0,
+            5.0,
+            10.0,
+            50.0,
+        ]
+        return [
+            {
+                "model__penalty": ["l2"],
+                "model__C": c_values,
+            },
+            {
+                "model__penalty": ["l1"],
+                "model__C": c_values,
+            },
+            {
+                "model__penalty": ["elasticnet"],
+                "model__C": [0.0001, 0.001, 0.01, 0.1, 1.0, 10.0],
+                "model__l1_ratio": [0.15, 0.5, 0.85],
+            },
+        ]
 
 
 class HistGradientBoostingCandidate(ChurnModelCandidate):
@@ -577,11 +726,10 @@ def cross_validate_candidate(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     groups_train: pd.Series,
-    n_splits: int,
-    random_state: int = 42,
+    cv: WalkForwardGroupSplitter,
 ) -> dict[str, float]:
-    """Runs group-aware, stratified K-fold cross-validation for one candidate
-    on the TRAINING split, and summarizes every `CV_SCORING` metric.
+    """Runs `cv` (see `WalkForwardGroupSplitter`) for one candidate on the
+    TRAINING split, and summarizes every `CV_SCORING` metric.
 
     This is what Phase 1 of `train_models` uses to decide which of the 3
     candidates wins -- never a single fit-once-score-on-test comparison,
@@ -591,7 +739,6 @@ def cross_validate_candidate(
     Returned in sklearn's "greater is better" convention (see
     `_LOSS_METRICS`); pass through `_humanize_cv_summary` before reporting.
     """
-    cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     scores = cross_validate(
         candidate.build_pipeline(),
         X_train,
@@ -649,13 +796,10 @@ def _cv_calibration_log_loss(
     calibrator_factory,
     oof_proba,
     y_train,
-    groups_train,
-    n_splits: int,
-    n_repeats: int = 5,
-    random_state: int = 42,
+    cv_folds: list[tuple[np.ndarray, np.ndarray]],
 ) -> float:
-    """Mean Log Loss of `calibrator_factory()`, cross-validated (group-aware,
-    repeated) on the model's own out-of-fold probabilities: fit on one
+    """Mean Log Loss of `calibrator_factory()`, cross-validated over
+    `cv_folds` on the model's own out-of-fold probabilities: fit on one
     fold's split, score on the other. This cross-validates the CALIBRATION
     STEP itself, for the same reason the model and its hyperparameters are
     picked from CV scores earlier in this module -- scoring a calibrator on
@@ -672,35 +816,31 @@ def _cv_calibration_log_loss(
     was ~0.80 -- see `select_calibrator`). That decile is a small slice of
     the data, so a squared-error average like Brier Score barely moves; Log
     Loss's logarithmic penalty for a confident, wrong prediction is large
-    enough to make that same slice tip the comparison the other way (~0.540
-    for isotonic vs. ~0.539 for sigmoid on this data) -- consistent with why
-    Log Loss, not ROC-AUC, is already this project's model/hyperparameter
-    selection metric (section 6.4).
+    enough to make that same slice tip the comparison the other way -- consistent
+    with why Log Loss, not ROC-AUC, is already this project's model/
+    hyperparameter selection metric (section 6.4).
 
-    Repeated `n_repeats` times with a different fold assignment each time
-    (same `n_splits`) and averaged over all `n_repeats * n_splits` scores,
-    since a single split is noisy enough to change which method wins by a
-    margin comparable to the gap between the two methods themselves.
+    `cv_folds` is a materialized list of (train_idx, val_idx) pairs, built by
+    the caller from `WalkForwardGroupSplitter` -- unlike a shuffled random
+    K-fold, a walk-forward split has no randomness to repeat over: the same
+    calendar months always produce the same folds.
     """
     oof_proba = np.asarray(oof_proba, dtype=float)
     y_arr = np.asarray(y_train)
-    groups_arr = np.asarray(groups_train)
     scores = []
-    for repeat in range(n_repeats):
-        cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state + repeat)
-        for train_idx, val_idx in cv.split(oof_proba.reshape(-1, 1), y_arr, groups=groups_arr):
-            calibrator = calibrator_factory().fit(oof_proba[train_idx], y_arr[train_idx])
-            calibrated = np.clip(calibrator.predict(oof_proba[val_idx]), 1e-6, 1 - 1e-6)
-            scores.append(log_loss(y_arr[val_idx], calibrated, labels=[0, 1]))
+    for train_idx, val_idx in cv_folds:
+        calibrator = calibrator_factory().fit(oof_proba[train_idx], y_arr[train_idx])
+        calibrated = np.clip(calibrator.predict(oof_proba[val_idx]), 1e-6, 1 - 1e-6)
+        scores.append(log_loss(y_arr[val_idx], calibrated, labels=[0, 1]))
     return float(np.mean(scores))
 
 
 def select_calibrator(
-    oof_proba, y_train, groups_train, n_splits: int, n_repeats: int = 5, random_state: int = 42
+    oof_proba, y_train, cv_folds: list[tuple[np.ndarray, np.ndarray]]
 ) -> tuple[str, object, dict[str, float]]:
     """Picks whichever method in `CALIBRATION_METHODS` gets the lowest
-    repeated-cross-validated Log Loss on the model's own out-of-fold
-    probabilities, then refits that method on all of them.
+    cross-validated Log Loss (over `cv_folds`) on the model's own
+    out-of-fold probabilities, then refits that method on all of them.
 
     Written after isotonic calibration, applied unconditionally, was found to
     make Brier Score/Log Loss on the held-out test set slightly WORSE for
@@ -712,15 +852,12 @@ def select_calibrator(
     isotonic, catches exactly that failure instead of shipping it -- but only
     once that comparison uses a metric sensitive enough to see it (see
     `_cv_calibration_log_loss`'s docstring for why Brier Score was not
-    sensitive enough here, and repeating the split enough times to be
-    stable).
+    sensitive enough here).
 
     Returns (method_name, fitted_calibrator, cv_log_loss_by_method).
     """
     cv_log_loss = {
-        name: _cv_calibration_log_loss(
-            factory, oof_proba, y_train, groups_train, n_splits, n_repeats, random_state
-        )
+        name: _cv_calibration_log_loss(factory, oof_proba, y_train, cv_folds)
         for name, factory in CALIBRATION_METHODS.items()
     }
     best_name = min(cv_log_loss, key=cv_log_loss.get)
@@ -767,49 +904,34 @@ def _cv_best_thresholds(
     selector: ThresholdSelector,
     y_true,
     y_proba,
-    groups,
-    n_splits: int,
-    n_repeats: int,
-    random_state: int,
+    cv_folds: list[tuple[np.ndarray, np.ndarray]],
 ) -> list[float]:
-    """Collects one F1-optimal threshold per fold, per repeat, group-aware
-    and stratified, using only that fold's training portion of `y_proba`.
+    """Collects one F1-optimal threshold per fold in `cv_folds`, using only
+    that fold's training portion of `y_proba`.
 
     A single sweep over the full out-of-fold array already avoids the
     in-sample overconfidence problem, but it still commits to whichever
     threshold looks best under one particular arrangement of clients into
-    folds. `select_calibrator` ran into the same issue when comparing
-    isotonic against sigmoid on a single split, and fixed it by repeating
-    the split several times and averaging. This does the same thing for the
-    threshold itself: many partial estimates, each computed on roughly 80%
-    of the out-of-fold data, average out the noise that any single 100%
-    estimate would carry.
+    folds. `select_calibrator` runs into the same issue comparing isotonic
+    against sigmoid, and handles it the same way: many partial estimates,
+    each computed on one fold's training portion of the out-of-fold data,
+    average out the noise that any single 100% estimate would carry.
     """
     y_arr = np.asarray(y_true)
     proba_arr = np.asarray(y_proba, dtype=float)
-    groups_arr = np.asarray(groups)
-    thresholds = []
-    for repeat in range(n_repeats):
-        cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state + repeat)
-        for train_idx, _ in cv.split(proba_arr.reshape(-1, 1), y_arr, groups=groups_arr):
-            thresholds.append(selector.select(y_arr[train_idx], proba_arr[train_idx]))
-    return thresholds
+    return [selector.select(y_arr[train_idx], proba_arr[train_idx]) for train_idx, _ in cv_folds]
 
 
-def select_threshold(
-    y_true, y_proba, groups, n_splits: int, n_repeats: int = 5, random_state: int = 42
-) -> float:
-    """Returns a decision threshold averaged over `n_repeats * n_splits`
-    F1-optimal estimates instead of a single sweep over all of `y_proba`.
+def select_threshold(y_true, y_proba, cv_folds: list[tuple[np.ndarray, np.ndarray]]) -> float:
+    """Returns a decision threshold averaged over one F1-optimal estimate per
+    fold in `cv_folds`, instead of a single sweep over all of `y_proba`.
 
     Reuses the already computed out-of-fold probabilities, the same ones
     `select_calibrator` uses, rather than refitting the underlying model
     again, since the instability being addressed here comes from how the
     data gets split, not from how the model itself was trained.
     """
-    thresholds = _cv_best_thresholds(
-        ThresholdSelector(), y_true, y_proba, groups, n_splits, n_repeats, random_state
-    )
+    thresholds = _cv_best_thresholds(ThresholdSelector(), y_true, y_proba, cv_folds)
     return float(np.mean(thresholds))
 
 
@@ -821,9 +943,9 @@ class CalibratedChurnModel(ClassifierMixin, BaseEstimator):
     ROC-AUC and PR-AUC only guarantee the latter, see `ModelEvaluator`.
 
     `calibrator` must be fit on OUT-OF-FOLD probabilities from `pipeline`'s
-    own training data, using `cross_val_predict` with the same group-aware
-    CV used everywhere else in this module, never on `pipeline`'s in-sample
-    predictions. Those are systematically overconfident, which would just
+    own training data, using `walk_forward_oof_predict_proba` with the same
+    walk-forward CV used everywhere else in this module, never on
+    `pipeline`'s in-sample predictions. Those are systematically overconfident, which would just
     teach the calibrator to reproduce the model's own uncalibrated output.
     This is the same reason hyperparameters are picked from CV scores
     rather than training-set scores. A model's opinion of itself, measured
@@ -1002,8 +1124,9 @@ if __name__ == "__main__":
         figure_path: Path = FIGURES_DIR / "07_curvas_roc.png",
         calibration_figure_path: Path = FIGURES_DIR / "14_calibracion.png",
         selection_metric: str = "log_loss",
-        cv_splits: int = 5,
-        test_size: float = 0.25,
+        min_val_size: int = 100,
+        min_train_size: int = 700,
+        test_size: float = 0.20,
     ) -> None:
         import joblib
         import matplotlib
@@ -1026,6 +1149,25 @@ if __name__ == "__main__":
             f"(churn={test_rate:.1%}), todos resueltos después del corte."
         )
 
+        # Un solo WalkForwardGroupSplitter para las 4 etapas que necesitan
+        # validación cruzada dentro del train (selección de candidato,
+        # tuning, calibración y umbral) -- ver su docstring y la nota del
+        # módulo sobre por qué reemplaza a StratifiedGroupKFold ahí.
+        # min_train_size descarta folds cuyo train sea tan chico (o tan
+        # anterior a RELIABLE_ACCESS_TRACKING_SINCE) que la estimación por
+        # fold sea inestable, en vez de dejar que unos pocos folds diminutos
+        # muevan el promedio.
+        wf_cv = WalkForwardGroupSplitter(
+            dates=split.dates_train, min_val_size=min_val_size, min_train_size=min_train_size
+        )
+        wf_windows = wf_cv.months()
+        wf_n_splits = wf_cv.get_n_splits(groups=split.groups_train)
+        logger.info(
+            f"Validación cruzada walk-forward: {wf_n_splits} folds "
+            f"(min_val_size={min_val_size}, min_train_size={min_train_size}), "
+            f"meses disponibles en train: {[str(m) for m in wf_windows]}."
+        )
+
         mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
         mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
 
@@ -1036,41 +1178,38 @@ if __name__ == "__main__":
         ]
 
         # --- Fase 1: elegir candidato ganador por validación cruzada -------
-        # Cada uno de los 3 candidatos se valida con StratifiedGroupKFold
-        # (n_splits=cv_splits) SOLO sobre el train set. El ganador se decide
-        # con `cv_mean_{selection_metric}` -- nunca con el test set, para no
-        # contaminar la única evaluación que queda para reportar desempeño
-        # final honesto. La curva ROC comparativa también se dibuja con
-        # probabilidades out-of-fold de esa misma validación cruzada, no con
-        # el test set. Cada candidato además se ajusta una vez sobre todo el
-        # train set y se evalúa en test aquí, pero solo para la tabla
-        # descriptiva ("test_..." en comparacion_modelos_churn.csv y MLflow)
-        # -- no participa en la elección ni en la figura.
+        # Cada uno de los 3 candidatos se valida con wf_cv SOLO sobre el
+        # train set. El ganador se decide con `cv_mean_{selection_metric}`
+        # -- nunca con el test set, para no contaminar la única evaluación
+        # que queda para reportar desempeño final honesto. La curva ROC
+        # comparativa también se dibuja con probabilidades out-of-fold de
+        # esa misma validación cruzada walk-forward, no con el test set; la
+        # ventana inicial de train nunca es validación (ver
+        # walk_forward_oof_predict_proba), así que la curva se dibuja solo
+        # con las filas que sí tuvieron una predicción fuera de muestra
+        # real. Cada candidato además se ajusta una vez sobre todo el train
+        # set y se evalúa en test aquí, pero solo para la tabla descriptiva
+        # ("test_..." en comparacion_modelos_churn.csv y MLflow) -- no
+        # participa en la elección ni en la figura.
         results = []
         cv_summaries_raw: dict[str, dict[str, float]] = {}
         fig, ax = plt.subplots(figsize=(7, 6))
 
         for candidate in candidates:
             with mlflow.start_run(run_name=f"{candidate.name}_entrenamiento"):
-                logger.info(
-                    f"{candidate.name}: validación cruzada "
-                    f"(StratifiedGroupKFold, n_splits={cv_splits})..."
-                )
+                logger.info(f"{candidate.name}: validación cruzada walk-forward...")
                 cv_summary_raw = cross_validate_candidate(
-                    candidate, split.X_train, split.y_train, split.groups_train, cv_splits
+                    candidate, split.X_train, split.y_train, split.groups_train, wf_cv
                 )
                 cv_summary = _humanize_cv_summary(cv_summary_raw)
 
-                oof_cv = StratifiedGroupKFold(n_splits=cv_splits, shuffle=True, random_state=42)
-                oof_proba = cross_val_predict(
+                oof_proba, covered = walk_forward_oof_predict_proba(
                     candidate.build_pipeline(),
                     split.X_train,
                     split.y_train,
-                    groups=split.groups_train,
-                    cv=oof_cv,
-                    method="predict_proba",
-                    n_jobs=candidate.n_jobs,
-                )[:, 1]
+                    split.groups_train,
+                    wf_cv,
+                )
 
                 pipeline = candidate.build_pipeline()
                 pipeline.fit(split.X_train, split.y_train)
@@ -1085,7 +1224,9 @@ if __name__ == "__main__":
                         "n_train": len(split.X_train),
                         "n_test": len(split.X_test),
                         "n_features": len(FEATURE_COLUMNS),
-                        "cv_splits": cv_splits,
+                        "wf_n_splits": wf_n_splits,
+                        "min_val_size": min_val_size,
+                        "min_train_size": min_train_size,
                     }
                 )
                 mlflow.log_metrics(cv_summary)
@@ -1104,7 +1245,7 @@ if __name__ == "__main__":
                 )
                 cv_summaries_raw[candidate.name] = cv_summary_raw
 
-            fpr, tpr, _ = roc_curve(split.y_train, oof_proba)
+            fpr, tpr, _ = roc_curve(split.y_train[covered], oof_proba[covered])
             ax.plot(
                 fpr, tpr, label=f"{candidate.name} (AUC={cv_summary['cv_mean_roc_auc']:.3f})"
             )
@@ -1112,7 +1253,7 @@ if __name__ == "__main__":
         ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Azar")
         ax.set_xlabel("Tasa de falsos positivos")
         ax.set_ylabel("Tasa de verdaderos positivos")
-        ax.set_title("Curvas ROC por modelo — validación cruzada sobre el conjunto de entrenamiento")
+        ax.set_title("Curvas ROC por modelo — validación cruzada walk-forward sobre el train")
         ax.legend()
         figure_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(figure_path, dpi=150, bbox_inches="tight")
@@ -1134,12 +1275,17 @@ if __name__ == "__main__":
         logger.info(f"Modelo ganador por validación cruzada ({selection_metric}): {best_name}")
 
         # --- Fase 2: tuning de hiperparámetros, elegido también por CV -----
-        tuner = HyperparameterTuner(n_splits=cv_splits, scoring=selection_metric)
+        tuner = HyperparameterTuner(cv=wf_cv, scoring=selection_metric)
         grid = winner.param_grid()
-        n_combos = int(np.prod([len(v) for v in grid.values()])) if grid else 1
+        grid_list = grid if isinstance(grid, list) else [grid] if grid else []
+        n_combos = sum(
+            int(np.prod([len(v) for v in sub_grid.values()])) if sub_grid else 0
+            for sub_grid in grid_list
+        ) or 1
         logger.info(
             f"{best_name}: probando {n_combos} combinaciones de hiperparámetros "
-            f"con StratifiedGroupKFold(n_splits={cv_splits}), n_jobs={winner.n_jobs}..."
+            f"con validación cruzada walk-forward ({wf_n_splits} folds), "
+            f"n_jobs={winner.n_jobs}..."
         )
 
         with mlflow.start_run(run_name=f"{best_name}_tuning"):
@@ -1164,7 +1310,9 @@ if __name__ == "__main__":
                     "n_train": len(split.X_train),
                     "n_test": len(split.X_test),
                     "n_features": len(FEATURE_COLUMNS),
-                    "cv_splits": cv_splits,
+                    "wf_n_splits": wf_n_splits,
+                    "min_val_size": min_val_size,
+                    "min_train_size": min_train_size,
                     "n_combinaciones": n_combos,
                     "scoring": selection_metric,
                     **best_params,
@@ -1212,71 +1360,87 @@ if __name__ == "__main__":
         # modelo final, que es justamente lo que se usa para estimar una
         # probabilidad de abandono y clasificar el riesgo en producción, ver
         # churn_detection/modeling/predict.py.
-        logger.info(f"{best_name}: generando probabilidades out-of-fold para calibración...")
-        calibration_cv = StratifiedGroupKFold(n_splits=cv_splits, shuffle=True, random_state=42)
-        oof_proba = cross_val_predict(
-            clone(best_pipeline),
-            split.X_train,
-            split.y_train,
-            groups=split.groups_train,
-            cv=calibration_cv,
-            method="predict_proba",
-            n_jobs=winner.n_jobs,
-        )[:, 1]
+        logger.info(f"{best_name}: generando probabilidades out-of-fold walk-forward para calibración...")
+        oof_proba, covered = walk_forward_oof_predict_proba(
+            clone(best_pipeline), split.X_train, split.y_train, split.groups_train, wf_cv
+        )
+        # La ventana inicial de train nunca fue validación (no hay datos
+        # anteriores con los que entrenar un fold que la valide -- ver
+        # walk_forward_oof_predict_proba), así que calibración y umbral se
+        # calculan únicamente sobre las filas que sí tuvieron una
+        # probabilidad fuera de muestra real, nunca sobre todo split.X_train.
+        y_covered = split.y_train[covered]
+        groups_covered = split.groups_train[covered]
+        dates_covered = split.dates_train[covered]
+        oof_covered = oof_proba[covered]
+        logger.info(
+            f"{best_name}: {covered.sum()}/{len(covered)} ciclos de train tuvieron "
+            "probabilidad out-of-fold walk-forward (el resto es la ventana inicial, "
+            "sin datos anteriores con los que validarla)."
+        )
+
+        # Folds walk-forward de nivel interno, sobre el subconjunto cubierto,
+        # para cross-validar el método de calibración y el umbral -- mismo
+        # principio que wf_cv, aplicado un nivel más abajo porque
+        # select_calibrator/select_threshold trabajan sobre oof_covered, no
+        # sobre split.X_train completo. Usa min_val_size también como piso
+        # del train, no min_train_size: lo que se ajusta acá es un
+        # calibrador de 1-2 parámetros (isotónica o sigmoid) o un barrido de
+        # umbral, no el pipeline de 11 variables -- exigirle el mismo mínimo
+        # de filas que a wf_cv deja muy pocos folds para una comparación que
+        # necesita varios para ser estable (ver select_calibrator).
+        calib_cv = WalkForwardGroupSplitter(
+            dates=dates_covered, min_val_size=min_val_size, min_train_size=min_val_size
+        )
+        calib_folds = list(calib_cv.split(groups=groups_covered))
+        logger.info(f"{best_name}: {len(calib_folds)} folds walk-forward para calibración y umbral.")
 
         # El método de calibración también se elige por validación cruzada
-        # (Log Loss, repetida, sobre las propias probabilidades out-of-fold),
-        # no se aplica isotónica sin más: con pocas observaciones out-of-fold
-        # en los deciles más extremos, isotónica puede sobreajustar un
-        # escalón muy pronunciado que no generaliza (ver docstring de
+        # (Log Loss, sobre las propias probabilidades out-of-fold), no se
+        # aplica isotónica sin más: con pocas observaciones out-of-fold en
+        # los deciles más extremos, isotónica puede sobreajustar un escalón
+        # muy pronunciado que no generaliza (ver docstring de
         # select_calibrator, incluyendo por qué Log Loss y no Brier Score).
         # sigmoid (Platt scaling) es más rígido y menos propenso a ese
         # sobreajuste.
         calibration_method, calibrator, calibration_cv_log_loss = select_calibrator(
-            oof_proba, split.y_train, split.groups_train, cv_splits
+            oof_covered, y_covered, calib_folds
         )
         logger.info(
             f"{best_name}: método de calibración elegido por validación cruzada "
             f"(Log Loss): {calibration_method} {calibration_cv_log_loss}"
         )
 
-        # El umbral de decisión también se elige por validación cruzada
-        # repetida, no se deja fijo en 0.5 ni se calcula con un solo barrido
-        # sobre toda la muestra out-of-fold. Se aplica el calibrador a esas
+        # El umbral de decisión también se elige por validación cruzada, no
+        # se deja fijo en 0.5 ni se calcula con un solo barrido sobre toda
+        # la muestra out-of-fold. Se aplica el calibrador a esas
         # probabilidades out-of-fold para obtener la probabilidad calibrada
         # que el modelo final realmente entregaría en cada ciclo de
         # entrenamiento, y select_threshold promedia el punto de corte que
-        # maximiza F1 sobre varias particiones agrupadas por cliente, en
-        # lugar de confiar en una sola, por la misma razón por la que
-        # select_calibrator no compara isotónica y sigmoid con una sola
-        # partición.
-        oof_proba_calibrated = np.clip(calibrator.predict(oof_proba), 0.0, 1.0)
-        threshold = select_threshold(
-            split.y_train, oof_proba_calibrated, split.groups_train, cv_splits
-        )
+        # maximiza F1 sobre los mismos folds walk-forward, en lugar de
+        # confiar en un solo barrido.
+        oof_proba_calibrated_covered = np.clip(calibrator.predict(oof_covered), 0.0, 1.0)
+        threshold = select_threshold(y_covered, oof_proba_calibrated_covered, calib_folds)
         logger.info(
-            f"{best_name}: umbral de decisión elegido por validación cruzada repetida (F1): "
+            f"{best_name}: umbral de decisión elegido por validación cruzada walk-forward (F1): "
             f"{threshold:.4f}"
         )
 
-        # Métricas promedio de validación cruzada del modelo YA calibrado: se
-        # reutilizan los mismos folds de calibration_cv que generaron
-        # oof_proba (StratifiedGroupKFold con el mismo random_state produce
-        # la misma partición), evaluando en cada fold con las probabilidades
-        # calibradas fuera de muestra y el umbral final. Es el mismo resumen
-        # (media y desviación estándar entre folds) que cross_validate_candidate
-        # y HyperparameterTuner ya reportan para elegir modelo e
-        # hiperparámetros, pero aplicado al pipeline calibrado completo en
-        # vez de al pipeline crudo.
-        oof_pred_calibrated = (oof_proba_calibrated >= threshold).astype(int)
+        # Métricas promedio de validación cruzada del modelo YA calibrado:
+        # se reutilizan calib_folds (los mismos folds walk-forward que
+        # generaron oof_covered), evaluando en cada fold con las
+        # probabilidades calibradas fuera de muestra y el umbral final. Es
+        # el mismo resumen (media y desviación estándar entre folds) que
+        # cross_validate_candidate y HyperparameterTuner ya reportan para
+        # elegir modelo e hiperparámetros, pero aplicado al pipeline
+        # calibrado completo en vez de al pipeline crudo.
+        oof_pred_calibrated_covered = (oof_proba_calibrated_covered >= threshold).astype(int)
         cv_calibrated_folds: dict[str, list[float]] = {metric: [] for metric in CV_SCORING}
-        for _, val_idx in calibration_cv.split(
-            split.X_train, split.y_train, groups=split.groups_train
-        ):
+        for _, val_idx in calib_folds:
             fold_metrics = ModelEvaluator.evaluate(
-                split.y_train.iloc[val_idx],
-                oof_pred_calibrated[val_idx],
-                oof_proba_calibrated[val_idx],
+                y_covered.iloc[val_idx],
+                oof_pred_calibrated_covered[val_idx],
+                oof_proba_calibrated_covered[val_idx],
             )
             for metric_name, value in fold_metrics.items():
                 cv_calibrated_folds[metric_name].append(value)

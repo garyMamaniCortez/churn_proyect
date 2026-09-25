@@ -16,11 +16,13 @@ from churn_detection.modeling.train import (
     LogisticRegressionCandidate,
     SigmoidCalibrator,
     ThresholdSelector,
+    WalkForwardGroupSplitter,
     cross_validate_candidate,
     plot_reliability_diagram,
     reliability_table,
     select_calibrator,
     select_threshold,
+    walk_forward_oof_predict_proba,
 )
 
 
@@ -256,6 +258,106 @@ def test_split_exposes_groups_train_matching_training_personas(sample_df):
     assert set(split.groups_train) == set(split.X_train["persona_id"])
 
 
+def test_split_exposes_dates_train_matching_training_rows(sample_df):
+    split = ChronologicalSplitter().split(sample_df, FEATURE_COLUMNS)
+    assert len(split.dates_train) == len(split.X_train)
+    assert (pd.to_datetime(split.dates_train) <= split.cutoff_date).all()
+
+
+def test_walk_forward_never_trains_on_dates_after_the_validation_window():
+    dates = pd.Series(
+        pd.to_datetime(
+            ["2025-11-15"] * 5 + ["2025-12-15"] * 5 + ["2026-01-15"] * 5 + ["2026-02-15"] * 5
+        )
+    )
+    groups = pd.Series(range(len(dates)))  # one client per row -- purging not exercised here
+    splitter = WalkForwardGroupSplitter(dates=dates, min_val_size=1, min_train_size=1)
+
+    folds = list(splitter.split(groups=groups))
+
+    assert len(folds) == 3  # validates on dec, jan, feb in turn
+    for train_idx, val_idx in folds:
+        assert dates.iloc[list(train_idx)].max() < dates.iloc[list(val_idx)].min()
+
+
+def test_walk_forward_purges_clients_seen_in_the_validation_window():
+    dates = pd.to_datetime(["2025-11-10", "2025-11-20", "2025-12-10", "2025-12-20"])
+    groups = pd.Series(["a", "b", "b", "c"])  # client "b" has a cycle in both nov and dec
+    splitter = WalkForwardGroupSplitter(dates=dates, min_val_size=1, min_train_size=1)
+
+    train_idx, val_idx = next(splitter.split(groups=groups))
+
+    # december is the validation month; client "b" must be purged from this
+    # fold's training rows even though their own november row falls before
+    # the cutoff -- otherwise their december outcome would leak through
+    # their own november row.
+    assert set(groups.iloc[list(train_idx)]) == {"a"}
+    assert set(groups.iloc[list(val_idx)]) == {"b", "c"}
+
+
+def test_walk_forward_skips_validation_windows_below_min_val_size():
+    dates = pd.Series(
+        pd.to_datetime(["2025-11-01"] * 10 + ["2025-12-01"] * 2 + ["2026-01-01"] * 10)
+    )
+    groups = pd.Series(range(len(dates)))
+    splitter = WalkForwardGroupSplitter(dates=dates, min_val_size=5, min_train_size=1)
+
+    folds = list(splitter.split(groups=groups))
+
+    # December only has 2 rows, below min_val_size=5 -- never a validation
+    # window on its own, but its rows still accumulate into the training
+    # set of the next fold that does qualify (january).
+    assert len(folds) == 1
+    train_idx, val_idx = folds[0]
+    assert set(dates.iloc[list(val_idx)]) == {pd.Timestamp("2026-01-01")}
+    assert pd.Timestamp("2025-12-01") in set(dates.iloc[list(train_idx)])
+
+
+def test_walk_forward_skips_folds_below_min_train_size():
+    # Same three months as the "never trains on the future" test above, but
+    # now the first candidate fold (train = november only, 5 rows) should be
+    # skipped for being too small to trust, even though its validation month
+    # (december, 5 rows) clears min_val_size on its own.
+    dates = pd.Series(
+        pd.to_datetime(["2025-11-15"] * 5 + ["2025-12-15"] * 5 + ["2026-01-15"] * 20)
+    )
+    groups = pd.Series(range(len(dates)))
+    splitter = WalkForwardGroupSplitter(dates=dates, min_val_size=1, min_train_size=8)
+
+    folds = list(splitter.split(groups=groups))
+
+    # Only the january fold has enough accumulated training data (nov + dec
+    # = 10 rows >= min_train_size=8); the december fold (train = november
+    # only, 5 rows) is skipped.
+    assert len(folds) == 1
+    train_idx, val_idx = folds[0]
+    assert set(dates.iloc[list(val_idx)]) == {pd.Timestamp("2026-01-15")}
+
+
+def test_walk_forward_get_n_splits_matches_split_output():
+    dates = pd.to_datetime(["2025-11-01"] * 5 + ["2025-12-01"] * 5 + ["2026-01-01"] * 5)
+    groups = pd.Series(range(len(dates)))
+    splitter = WalkForwardGroupSplitter(dates=dates, min_val_size=1, min_train_size=1)
+
+    assert splitter.get_n_splits(groups=groups) == len(list(splitter.split(groups=groups)))
+
+
+def test_walk_forward_oof_predict_proba_leaves_the_seed_window_uncovered(sample_df):
+    split = ChronologicalSplitter().split(sample_df, FEATURE_COLUMNS)
+    wf_cv = WalkForwardGroupSplitter(dates=split.dates_train, min_val_size=5, min_train_size=5)
+    candidate = LogisticRegressionCandidate()
+
+    oof_proba, covered = walk_forward_oof_predict_proba(
+        candidate.build_pipeline(), split.X_train, split.y_train, split.groups_train, wf_cv
+    )
+
+    assert covered.sum() > 0
+    assert not covered.all()  # the seed window never gets a validation prediction
+    assert np.isnan(oof_proba[~covered]).all()
+    assert not np.isnan(oof_proba[covered]).any()
+    assert (oof_proba[covered] >= 0).all() and (oof_proba[covered] <= 1).all()
+
+
 @pytest.mark.parametrize(
     "candidate_factory",
     [LogisticRegressionCandidate, HistGradientBoostingCandidate, NeuralNetworkCandidate],
@@ -263,15 +365,22 @@ def test_split_exposes_groups_train_matching_training_personas(sample_df):
 def test_every_candidate_declares_a_non_empty_prefixed_param_grid(candidate_factory):
     grid = candidate_factory().param_grid()
     assert len(grid) > 0
-    for key in grid:
-        assert key.startswith("model__")
+    # LogisticRegressionCandidate declares a LIST of sub-grids (one per
+    # penalty, since elasticnet needs l1_ratio and the others don't) --
+    # GridSearchCV accepts either shape, so both are valid here.
+    sub_grids = grid if isinstance(grid, list) else [grid]
+    for sub_grid in sub_grids:
+        assert len(sub_grid) > 0
+        for key in sub_grid:
+            assert key.startswith("model__")
 
 
 def test_tuner_with_empty_grid_just_fits_the_pipeline(sample_df):
     split = ChronologicalSplitter().split(sample_df, FEATURE_COLUMNS)
     pipeline = HistGradientBoostingCandidate().build_pipeline()
 
-    tuner = HyperparameterTuner(n_splits=3)
+    wf_cv = WalkForwardGroupSplitter(dates=split.dates_train, min_val_size=5, min_train_size=5)
+    tuner = HyperparameterTuner(cv=wf_cv)
     fitted, best_params, cv_metrics = tuner.tune(
         pipeline, {}, split.X_train, split.y_train, split.groups_train
     )
@@ -286,7 +395,8 @@ def test_tuner_picks_best_params_from_the_provided_grid(sample_df):
     split = ChronologicalSplitter().split(sample_df, FEATURE_COLUMNS)
     candidate = LogisticRegressionCandidate()
 
-    tuner = HyperparameterTuner(n_splits=3)
+    wf_cv = WalkForwardGroupSplitter(dates=split.dates_train, min_val_size=5, min_train_size=5)
+    tuner = HyperparameterTuner(cv=wf_cv)
     fitted, best_params, cv_metrics = tuner.tune(
         candidate.build_pipeline(),
         candidate.param_grid(),
@@ -295,7 +405,10 @@ def test_tuner_picks_best_params_from_the_provided_grid(sample_df):
         split.groups_train,
     )
 
-    assert best_params["model__C"] in candidate.param_grid()["model__C"]
+    # candidate.param_grid() is a list of per-penalty sub-grids; collect the
+    # C values across all of them rather than assuming a single flat dict.
+    all_c_values = {c for sub_grid in candidate.param_grid() for c in sub_grid["model__C"]}
+    assert best_params["model__C"] in all_c_values
     assert set(cv_metrics) == {f"cv_{stat}_{m}" for m in CV_SCORING for stat in ("mean", "std")}
     proba = fitted.predict_proba(split.X_test)[:, 1]
     assert (proba >= 0).all() and (proba <= 1).all()
@@ -320,7 +433,8 @@ def test_tuner_works_end_to_end_for_the_neural_network_candidate(sample_df):
     split = ChronologicalSplitter().split(sample_df, FEATURE_COLUMNS)
     candidate = NeuralNetworkCandidate()
 
-    tuner = HyperparameterTuner(n_splits=3)
+    wf_cv = WalkForwardGroupSplitter(dates=split.dates_train, min_val_size=5, min_train_size=5)
+    tuner = HyperparameterTuner(cv=wf_cv)
     fitted, best_params, cv_metrics = tuner.tune(
         candidate.build_pipeline(),
         candidate.param_grid(),
@@ -339,8 +453,9 @@ def test_cross_validate_candidate_returns_mean_and_std_for_every_metric(sample_d
     split = ChronologicalSplitter().split(sample_df, FEATURE_COLUMNS)
     candidate = LogisticRegressionCandidate()
 
+    wf_cv = WalkForwardGroupSplitter(dates=split.dates_train, min_val_size=5, min_train_size=5)
     summary = cross_validate_candidate(
-        candidate, split.X_train, split.y_train, split.groups_train, n_splits=3
+        candidate, split.X_train, split.y_train, split.groups_train, wf_cv
     )
 
     assert set(summary) == {f"cv_{stat}_{m}" for m in CV_SCORING for stat in ("mean", "std")}
@@ -416,20 +531,20 @@ def test_threshold_selector_picks_the_f1_maximizing_cutoff():
     assert chosen_f1 == pytest.approx(best_f1)
 
 
-def test_select_threshold_averages_over_repeated_group_aware_folds(sample_df):
+def test_select_threshold_averages_over_walk_forward_folds(sample_df):
     # select_threshold must not just delegate to a single ThresholdSelector
     # sweep over the whole sample: that was the earlier, less stable version
-    # of this function. It should average several partial estimates instead,
-    # so the result is close to, but not necessarily identical to, the
-    # single-sweep answer.
+    # of this function. It should average one estimate per walk-forward
+    # fold instead, so the result is close to, but not necessarily
+    # identical to, the single-sweep answer.
     split = ChronologicalSplitter().split(sample_df, FEATURE_COLUMNS)
     pipeline = LogisticRegressionCandidate().build_pipeline()
     pipeline.fit(split.X_train, split.y_train)
     oof_proba = pipeline.predict_proba(split.X_train)[:, 1]
 
-    threshold = select_threshold(
-        split.y_train, oof_proba, split.groups_train, n_splits=3, n_repeats=2
-    )
+    wf_cv = WalkForwardGroupSplitter(dates=split.dates_train, min_val_size=5, min_train_size=5)
+    cv_folds = list(wf_cv.split(groups=split.groups_train))
+    threshold = select_threshold(split.y_train, oof_proba, cv_folds)
 
     assert 0.0 <= threshold <= 1.0
     assert not np.isnan(threshold)
@@ -483,9 +598,9 @@ def test_select_calibrator_picks_the_lower_cv_log_loss_method(sample_df):
     pipeline.fit(split.X_train, split.y_train)
     oof_proba = pipeline.predict_proba(split.X_train)[:, 1]
 
-    method, calibrator, cv_log_loss = select_calibrator(
-        oof_proba, split.y_train, split.groups_train, n_splits=3, n_repeats=2
-    )
+    wf_cv = WalkForwardGroupSplitter(dates=split.dates_train, min_val_size=5, min_train_size=5)
+    cv_folds = list(wf_cv.split(groups=split.groups_train))
+    method, calibrator, cv_log_loss = select_calibrator(oof_proba, split.y_train, cv_folds)
 
     assert set(cv_log_loss) == set(CALIBRATION_METHODS)
     assert method == min(cv_log_loss, key=cv_log_loss.get)
