@@ -381,12 +381,13 @@ def test_tuner_with_empty_grid_just_fits_the_pipeline(sample_df):
 
     wf_cv = WalkForwardGroupSplitter(dates=split.dates_train, min_val_size=5, min_train_size=5)
     tuner = HyperparameterTuner(cv=wf_cv)
-    fitted, best_params, cv_metrics = tuner.tune(
+    fitted, best_params, cv_metrics, sensitivity = tuner.tune(
         pipeline, {}, split.X_train, split.y_train, split.groups_train
     )
 
     assert best_params == {}
     assert cv_metrics == {}
+    assert sensitivity.empty
     proba = fitted.predict_proba(split.X_test)[:, 1]
     assert (proba >= 0).all() and (proba <= 1).all()
 
@@ -397,7 +398,7 @@ def test_tuner_picks_best_params_from_the_provided_grid(sample_df):
 
     wf_cv = WalkForwardGroupSplitter(dates=split.dates_train, min_val_size=5, min_train_size=5)
     tuner = HyperparameterTuner(cv=wf_cv)
-    fitted, best_params, cv_metrics = tuner.tune(
+    fitted, best_params, cv_metrics, sensitivity = tuner.tune(
         candidate.build_pipeline(),
         candidate.param_grid(),
         split.X_train,
@@ -410,6 +411,15 @@ def test_tuner_picks_best_params_from_the_provided_grid(sample_df):
     all_c_values = {c for sub_grid in candidate.param_grid() for c in sub_grid["model__C"]}
     assert best_params["model__C"] in all_c_values
     assert set(cv_metrics) == {f"cv_{stat}_{m}" for m in CV_SCORING for stat in ("mean", "std")}
+    # One row per combination actually tested, with the same set of
+    # cv_mean_*/cv_std_* columns as `cv_metrics`, plus the hyperparameter
+    # columns themselves (e.g. model__C).
+    n_combos = sum(int(np.prod([len(v) for v in g.values()])) for g in candidate.param_grid())
+    assert len(sensitivity) == n_combos
+    assert "model__C" in sensitivity.columns
+    for m in CV_SCORING:
+        assert f"cv_mean_{m}" in sensitivity.columns
+        assert f"cv_std_{m}" in sensitivity.columns
     proba = fitted.predict_proba(split.X_test)[:, 1]
     assert (proba >= 0).all() and (proba <= 1).all()
 
@@ -435,7 +445,7 @@ def test_tuner_works_end_to_end_for_the_neural_network_candidate(sample_df):
 
     wf_cv = WalkForwardGroupSplitter(dates=split.dates_train, min_val_size=5, min_train_size=5)
     tuner = HyperparameterTuner(cv=wf_cv)
-    fitted, best_params, cv_metrics = tuner.tune(
+    fitted, best_params, cv_metrics, sensitivity = tuner.tune(
         candidate.build_pipeline(),
         candidate.param_grid(),
         split.X_train,
@@ -445,6 +455,7 @@ def test_tuner_works_end_to_end_for_the_neural_network_candidate(sample_df):
 
     assert best_params  # a real (non-empty) choice was made, not skipped
     assert cv_metrics
+    assert not sensitivity.empty
     proba = fitted.predict_proba(split.X_test)[:, 1]
     assert (proba >= 0).all() and (proba <= 1).all()
 

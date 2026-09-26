@@ -348,6 +348,31 @@ def _humanize_cv_summary(cv_summary: dict[str, float]) -> dict[str, float]:
     return out
 
 
+def _build_sensitivity_table(search: GridSearchCV) -> pd.DataFrame:
+    """One row per hyperparameter combination the grid search evaluated, not
+    just the winning one at `best_index_` -- the hyperparameter sensitivity
+    analysis needs the whole grid to tell whether Log Loss stays roughly
+    flat across combinations (a robust choice, any nearby combination would
+    have done about as well) or swings widely (a fragile one, where a
+    slightly different train/validation split could easily have picked a
+    very different "best" combination). Columns are the searched
+    hyperparameters plus, for every metric in `CV_SCORING`, its mean and
+    standard deviation across the CV folds -- same quantities `tune()`
+    already returns for the winner alone. Already humanized (see
+    `_humanize_cv_summary`): loss metrics are positive and lower-is-better,
+    not sklearn's internal negated convention.
+    """
+    table = pd.DataFrame(search.cv_results_["params"])
+    for metric_name in CV_SCORING:
+        mean = np.asarray(search.cv_results_[f"mean_test_{metric_name}"], dtype=float)
+        std = np.asarray(search.cv_results_[f"std_test_{metric_name}"], dtype=float)
+        if metric_name in _LOSS_METRICS:
+            mean = -mean
+        table[f"cv_mean_{metric_name}"] = mean
+        table[f"cv_std_{metric_name}"] = std
+    return table.sort_values("cv_mean_log_loss").reset_index(drop=True)
+
+
 class HyperparameterTuner:
     """Grid search cross-validated with `cv` (see `WalkForwardGroupSplitter`).
 
@@ -368,8 +393,8 @@ class HyperparameterTuner:
 
     def tune(
         self, pipeline: Pipeline, param_grid: dict, X, y, groups, n_jobs: int = -1
-    ) -> tuple[Pipeline, dict, dict]:
-        """Returns (best_estimator, best_params, cv_metrics).
+    ) -> tuple[Pipeline, dict, dict, pd.DataFrame]:
+        """Returns (best_estimator, best_params, cv_metrics, sensitivity).
 
         `cv_metrics` holds the mean AND standard deviation, across the CV
         folds, of *every* metric in `CV_SCORING` -- not just the one
@@ -384,10 +409,14 @@ class HyperparameterTuner:
         in sklearn's "greater is better" convention (see `_LOSS_METRICS`);
         callers that report these numbers should pass them through
         `_humanize_cv_summary` first.
+
+        `sensitivity` is the same information for EVERY combination the grid
+        tested, not just the winner -- see `_build_sensitivity_table` for
+        why. Empty when `param_grid` is empty (nothing to search).
         """
         if not param_grid:
             pipeline.fit(X, y)
-            return pipeline, {}, {}
+            return pipeline, {}, {}, pd.DataFrame()
 
         search = GridSearchCV(
             pipeline,
@@ -407,7 +436,8 @@ class HyperparameterTuner:
             cv_metrics[f"cv_std_{metric_name}"] = float(
                 search.cv_results_[f"std_test_{metric_name}"][best_idx]
             )
-        return search.best_estimator_, search.best_params_, cv_metrics
+        sensitivity = _build_sensitivity_table(search)
+        return search.best_estimator_, search.best_params_, cv_metrics, sensitivity
 
 
 class _Log1pSkewedColumns:
@@ -590,14 +620,25 @@ class NeuralNetworkCandidate(ChurnModelCandidate):
         )
 
     def param_grid(self) -> dict:
-        # Deliberately small: each combination refits the network from scratch
-        # for every CV fold, and unlike the other two candidates this one has
-        # no cheap way to skip redundant work. hidden_units controls capacity,
-        # learning_rate controls how well gradient descent actually converges
-        # within `epochs` -- the two knobs most likely to matter here.
+        # Grilla ampliada respecto a una version anterior que solo probaba 2
+        # arquitecturas de 2 capas: agrega arquitecturas de 3 capas ocultas y
+        # capas mas anchas (hasta 64 unidades) para cubrir mas capacidad del
+        # modelo, ademas de mas tasas de aprendizaje. Cada combinacion sigue
+        # reentrenando la red desde cero en cada fold de la validacion
+        # cruzada walk-forward -- a diferencia de los otros dos candidatos,
+        # esta red no tiene forma barata de evitar ese trabajo repetido, asi
+        # que el costo total crece linealmente con el numero de combinaciones.
         return {
-            "model__hidden_units": [(32, 16), (16, 8)],
-            "model__learning_rate": [1e-3, 1e-2],
+            "model__hidden_units": [
+                (16, 8),
+                (32, 16),
+                (64, 32),
+                (32, 16, 8),
+                (64, 32, 16),
+                (64, 32, 16, 8),
+                (124, 64, 32, 16)
+            ],
+            "model__learning_rate": [1e-4, 5e-4, 1e-3, 5e-3, 1e-2],
         }
 
 
@@ -1268,87 +1309,169 @@ if __name__ == "__main__":
         comparison.to_csv(comparison_path, index=False)
         logger.info(f"Comparación de modelos (validación cruzada):\n{comparison}")
 
-        best_name = max(
-            cv_summaries_raw, key=lambda name: cv_summaries_raw[name][f"cv_mean_{selection_metric}"]
-        )
-        winner = next(c for c in candidates if c.name == best_name)
-        logger.info(f"Modelo ganador por validación cruzada ({selection_metric}): {best_name}")
-
-        # --- Fase 2: tuning de hiperparámetros, elegido también por CV -----
-        tuner = HyperparameterTuner(cv=wf_cv, scoring=selection_metric)
-        grid = winner.param_grid()
-        grid_list = grid if isinstance(grid, list) else [grid] if grid else []
-        n_combos = sum(
-            int(np.prod([len(v) for v in sub_grid.values()])) if sub_grid else 0
-            for sub_grid in grid_list
-        ) or 1
+        # Los dos candidatos con mejor cv_mean_{selection_metric} pasan a la
+        # fase de tuning -- todavía no se descarta un modelo ganador único,
+        # sino que ambos se afinan por separado y recién se elige uno de los
+        # dos ya tuneados (ver Fase 2).
+        top2_names = sorted(
+            cv_summaries_raw,
+            key=lambda name: cv_summaries_raw[name][f"cv_mean_{selection_metric}"],
+            reverse=True,
+        )[:2]
         logger.info(
-            f"{best_name}: probando {n_combos} combinaciones de hiperparámetros "
-            f"con validación cruzada walk-forward ({wf_n_splits} folds), "
-            f"n_jobs={winner.n_jobs}..."
+            f"Modelos candidatos retenidos por validación cruzada ({selection_metric}): "
+            f"{top2_names}"
         )
 
-        with mlflow.start_run(run_name=f"{best_name}_tuning"):
-            best_pipeline, best_params, cv_metrics_raw = tuner.tune(
-                winner.build_pipeline(),
-                grid,
-                split.X_train,
-                split.y_train,
-                split.groups_train,
-                n_jobs=winner.n_jobs,
-            )
-            cv_metrics = _humanize_cv_summary(cv_metrics_raw)
+        # --- Fase 2: tuning de hiperparámetros de cada uno de los 2 candidatos
+        # retenidos, con un análisis de sensibilidad de cada uno frente a su
+        # propia grilla de hiperparámetros ------------------------------
+        tuner = HyperparameterTuner(cv=wf_cv, scoring=selection_metric)
+        tuned: dict[str, dict] = {}
+        tuning_rows = []
 
-            y_pred_raw = best_pipeline.predict(split.X_test)
-            y_proba_raw = best_pipeline.predict_proba(split.X_test)[:, 1]
-            tuned_metrics_raw = ModelEvaluator.evaluate(split.y_test, y_pred_raw, y_proba_raw)
-
-            mlflow.log_params(
-                {
-                    "model": best_name,
-                    "stage": "tuning",
-                    "n_train": len(split.X_train),
-                    "n_test": len(split.X_test),
-                    "n_features": len(FEATURE_COLUMNS),
-                    "wf_n_splits": wf_n_splits,
-                    "min_val_size": min_val_size,
-                    "min_train_size": min_train_size,
-                    "n_combinaciones": n_combos,
-                    "scoring": selection_metric,
-                    **best_params,
-                }
-            )
-            # Métricas de la mejor combinación de hiperparámetros encontrada:
-            # media y desviación estándar, a través de los folds del
-            # GridSearchCV, de cada métrica en CV_SCORING (elegida por
-            # validación, ver HyperparameterTuner).
-            mlflow.log_metrics(cv_metrics)
-            # Métricas del modelo ya afinado (sin calibrar todavía) en el
-            # test set held-out -- reporte final, no usado para elegir nada.
-            mlflow.log_metrics({f"test_sin_calibrar_{k}": v for k, v in tuned_metrics_raw.items()})
-            mlflow.sklearn.log_model(
-                best_pipeline, artifact_path="model", serialization_format="pickle"
-            )
-
-            # Misma idea que la tabla "comparison" de la Fase 1, pero acá
-            # una fila por métrica: media y desviación del CV al lado del
-            # valor final en el test set, para el modelo ganador afinado.
-            tuning_metrics = pd.DataFrame(
-                {
-                    "metrica": list(CV_SCORING.keys()),
-                    "cv_mean": [cv_metrics[f"cv_mean_{m}"] for m in CV_SCORING],
-                    "cv_std": [cv_metrics[f"cv_std_{m}"] for m in CV_SCORING],
-                    "test": [tuned_metrics_raw[m] for m in CV_SCORING],
-                }
-            )
-            tuning_metrics_path.parent.mkdir(parents=True, exist_ok=True)
-            tuning_metrics.to_csv(tuning_metrics_path, index=False)
+        for name in top2_names:
+            candidate = next(c for c in candidates if c.name == name)
+            grid = candidate.param_grid()
+            grid_list = grid if isinstance(grid, list) else [grid] if grid else []
+            n_combos = sum(
+                int(np.prod([len(v) for v in sub_grid.values()])) if sub_grid else 0
+                for sub_grid in grid_list
+            ) or 1
             logger.info(
-                f"Métricas de tuning ({best_name}) — CV (media/desviación) vs. "
-                f"test (sin calibrar):\n{tuning_metrics}"
+                f"{name}: probando {n_combos} combinaciones de hiperparámetros "
+                f"con validación cruzada walk-forward ({wf_n_splits} folds), "
+                f"n_jobs={candidate.n_jobs}..."
             )
 
-            logger.success(f"{best_name} (tuning): mejores params={best_params}")
+            with mlflow.start_run(run_name=f"{name}_tuning"):
+                best_pipeline_i, best_params_i, cv_metrics_raw_i, sensitivity_raw = tuner.tune(
+                    candidate.build_pipeline(),
+                    grid,
+                    split.X_train,
+                    split.y_train,
+                    split.groups_train,
+                    n_jobs=candidate.n_jobs,
+                )
+                cv_metrics_i = _humanize_cv_summary(cv_metrics_raw_i)
+
+                y_pred_raw_i = best_pipeline_i.predict(split.X_test)
+                y_proba_raw_i = best_pipeline_i.predict_proba(split.X_test)[:, 1]
+                tuned_metrics_raw_i = ModelEvaluator.evaluate(split.y_test, y_pred_raw_i, y_proba_raw_i)
+
+                mlflow.log_params(
+                    {
+                        "model": name,
+                        "stage": "tuning",
+                        "n_train": len(split.X_train),
+                        "n_test": len(split.X_test),
+                        "n_features": len(FEATURE_COLUMNS),
+                        "wf_n_splits": wf_n_splits,
+                        "min_val_size": min_val_size,
+                        "min_train_size": min_train_size,
+                        "n_combinaciones": n_combos,
+                        "scoring": selection_metric,
+                        **best_params_i,
+                    }
+                )
+                # Métricas de la mejor combinación de hiperparámetros
+                # encontrada para este candidato: media y desviación
+                # estándar, a través de los folds del GridSearchCV, de cada
+                # métrica en CV_SCORING (elegida por validación, ver
+                # HyperparameterTuner).
+                mlflow.log_metrics(cv_metrics_i)
+                # Métricas del modelo ya afinado (sin calibrar todavía) en el
+                # test set held-out -- reporte final, no usado para elegir nada.
+                mlflow.log_metrics(
+                    {f"test_sin_calibrar_{k}": v for k, v in tuned_metrics_raw_i.items()}
+                )
+                mlflow.sklearn.log_model(
+                    best_pipeline_i, artifact_path="model", serialization_format="pickle"
+                )
+
+                # Análisis de sensibilidad: cómo varía cv_mean_{selection_metric}
+                # entre TODAS las combinaciones de la grilla de este candidato,
+                # no solo la ganadora -- un rango angosto indica un modelo
+                # robusto frente a la elección de hiperparámetros, un rango
+                # amplio indica que la combinación ganadora podría haber sido
+                # distinta con una partición ligeramente diferente.
+                if not sensitivity_raw.empty:
+                    loss_col = f"cv_mean_{selection_metric}"
+                    sensitivity_path = (
+                        tuning_metrics_path.parent / f"sensibilidad_hiperparametros_{name}.csv"
+                    )
+                    sensitivity_path.parent.mkdir(parents=True, exist_ok=True)
+                    sensitivity_raw.to_csv(sensitivity_path, index=False)
+                    logger.info(
+                        f"{name}: análisis de sensibilidad sobre {len(sensitivity_raw)} "
+                        f"combinaciones de hiperparámetros -- {selection_metric} entre "
+                        f"{sensitivity_raw[loss_col].min():.4f} y "
+                        f"{sensitivity_raw[loss_col].max():.4f} "
+                        f"(desviación estándar entre combinaciones: "
+                        f"{sensitivity_raw[loss_col].std():.4f}). Guardado en {sensitivity_path}"
+                    )
+                    mlflow.log_metrics(
+                        {
+                            f"sensibilidad_{selection_metric}_min": float(
+                                sensitivity_raw[loss_col].min()
+                            ),
+                            f"sensibilidad_{selection_metric}_max": float(
+                                sensitivity_raw[loss_col].max()
+                            ),
+                            f"sensibilidad_{selection_metric}_std": float(
+                                sensitivity_raw[loss_col].std()
+                            ),
+                        }
+                    )
+
+                for m in CV_SCORING:
+                    tuning_rows.append(
+                        {
+                            "modelo": name,
+                            "metrica": m,
+                            "cv_mean": cv_metrics_i[f"cv_mean_{m}"],
+                            "cv_std": cv_metrics_i[f"cv_std_{m}"],
+                            "test": tuned_metrics_raw_i[m],
+                        }
+                    )
+
+                logger.success(f"{name} (tuning): mejores params={best_params_i}")
+
+            tuned[name] = {
+                "pipeline": best_pipeline_i,
+                "params": best_params_i,
+                "cv_metrics_raw": cv_metrics_raw_i,
+                "cv_metrics": cv_metrics_i,
+                "test_metrics_raw": tuned_metrics_raw_i,
+            }
+
+        # Misma idea que la tabla "comparison" de la Fase 1, pero acá una
+        # fila por métrica y por modelo tuneado: media y desviación del CV
+        # al lado del valor final en el test set, para cada uno de los 2
+        # candidatos ya afinados.
+        tuning_metrics = pd.DataFrame(tuning_rows)
+        tuning_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        tuning_metrics.to_csv(tuning_metrics_path, index=False)
+        logger.info(
+            f"Métricas de tuning ({', '.join(top2_names)}) — CV (media/desviación) vs. "
+            f"test (sin calibrar):\n{tuning_metrics}"
+        )
+
+        # De los 2 modelos ya tuneados, se selecciona el que tenga mejor
+        # cv_mean_{selection_metric} -- el mismo criterio de la Fase 1 -- para
+        # continuar con la calibración de probabilidades.
+        best_name = max(
+            tuned, key=lambda name: tuned[name]["cv_metrics_raw"][f"cv_mean_{selection_metric}"]
+        )
+        best_pipeline = tuned[best_name]["pipeline"]
+        best_params = tuned[best_name]["params"]
+        cv_metrics = tuned[best_name]["cv_metrics"]
+        tuned_metrics_raw = tuned[best_name]["test_metrics_raw"]
+        y_proba_raw = best_pipeline.predict_proba(split.X_test)[:, 1]
+        logger.success(
+            f"Modelo final seleccionado entre los modelos tuneados por validación "
+            f"cruzada ({selection_metric}): {best_name}, params={best_params}"
+        )
 
         # --- Fase 3: calibración y umbral, ambos elegidos por CV ---
         # El tuning anterior eligió el mejor modelo y sus hiperparámetros por
