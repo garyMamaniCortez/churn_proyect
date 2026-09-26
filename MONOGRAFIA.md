@@ -49,9 +49,9 @@ Cochabamba \- Bolivia
 
 [Aprendizaje automático supervisado	9](#aprendizaje-automático-supervisado)
 
-[6.3 Técnicas y algoritmos relacionados	9](#6.3-técnicas-y-algoritmos-relacionados)
+[6.3 Técnicas y algoritmos relacionados	10](#6.3-técnicas-y-algoritmos-relacionados)
 
-[Regresión Logística	9](#regresión-logística)
+[Regresión Logística	10](#regresión-logística)
 
 [Gradient Boosting	10](#gradient-boosting)
 
@@ -59,7 +59,7 @@ Cochabamba \- Bolivia
 
 [Preparación de variables	10](#preparación-de-variables)
 
-[6.4 Métricas de evaluación	10](#6.4-métricas-de-evaluación)
+[6.4 Métricas de evaluación	11](#6.4-métricas-de-evaluación)
 
 [Matriz de confusión	11](#matriz-de-confusión)
 
@@ -69,7 +69,7 @@ Cochabamba \- Bolivia
 
 [F1-score	11](#f1-score)
 
-[Puntaje de Brier	11](#puntaje-de-brier)
+[Puntaje de Brier	12](#puntaje-de-brier)
 
 [Log Loss	12](#log-loss)
 
@@ -77,7 +77,7 @@ Cochabamba \- Bolivia
 
 [Área bajo la curva Precisión-Recall (PR-AUC)	12](#área-bajo-la-curva-precisión-recall-\(pr-auc\))
 
-[6.5 Metodología CRISP-DM	12](#6.5-metodología-crisp-dm)
+[6.5 Metodología CRISP-DM	13](#6.5-metodología-crisp-dm)
 
 [**7\. DESARROLLO (SECCIÓN APLICATIVA: CRISP-DM)	13**](#7.-desarrollo-\(sección-aplicativa:-crisp-dm\))
 
@@ -137,51 +137,57 @@ Cochabamba \- Bolivia
 
 [7.5.3 Comparación entre Regresión Logística y Regresión Logística Optimizada	30](#7.5.3-comparación-entre-regresión-logística-y-regresión-logística-optimizada)
 
-[7.5.4 Calibración de probabilidades del modelo final	31](#7.5.6-calibración-de-probabilidades-de-ambos-modelos)
+[7.5.4 Optimización del modelo Red Neuronal	30](#7.5.4-optimización-del-modelo-red-neuronal)
 
-[7.5.5 Análisis de errores de clasificación del modelo optimizado	32](#7.5.7-análisis-de-errores-de-clasificación-de-los-modelos-optimizados)
+[7.5.5  Comparación entre Red Neuronal y Red Neuronal optimizada	31](#7.5.5-comparación-entre-red-neuronal-y-red-neuronal-optimizada)
 
-[7.5.6 Análisis de desempeño y posibles señales de sobreajuste	33](#7.5.8-análisis-de-desempeño-y-posibles-señales-de-sobreajuste)
+[7.5.6 Calibración de probabilidades de ambos modelos	32](#7.5.6-calibración-de-probabilidades-de-ambos-modelos)
 
-[7.5.7 Selección del modelo candidato final	33](#7.5.10-selección-del-modelo-candidato-final)
+[7.5.7 Análisis de errores de clasificación de los modelos optimizados	34](#7.5.7-análisis-de-errores-de-clasificación-de-los-modelos-optimizados)
 
-[7.6 Despliegue	33](#7.6-despliegue)
+[7.5.8 Análisis de desempeño y posibles señales de sobreajuste	36](#7.5.8-análisis-de-desempeño-y-posibles-señales-de-sobreajuste)
 
-[7.6.1 Arquitectura del proceso de generación de resultados	34](#7.6.1-arquitectura-del-proceso-de-generación-de-resultados)
+[7.5.9 Análisis de sensibilidad de hiperparámetros	37](#7.5.9-análisis-de-sensibilidad-de-hiperparámetros)
 
-[7.6.2 Integración del modelo seleccionado	34](#7.6.2-integración-del-modelo-seleccionado)
+[7.5.10 Selección del modelo candidato final	38](#7.5.10-selección-del-modelo-candidato-final)
 
-[7.6.3 Construcción de las variables de entrada	34](#7.6.3-construcción-de-las-variables-de-entrada)
+[7.6 Despliegue	38](#7.6-despliegue)
 
-[7.6.4 Generación de la predicción y clasificación de riesgo	34](#7.6.4-generación-de-la-predicción-y-clasificación-de-riesgo)
+[7.6.1 Arquitectura del proceso de generación de resultados	38](#7.6.1-arquitectura-del-proceso-de-generación-de-resultados)
 
-[7.6.5 Generación del archivo de resultados	35](#7.6.5-generación-del-archivo-de-resultados)
+[7.6.2 Integración del modelo seleccionado	39](#7.6.2-integración-del-modelo-seleccionado)
 
-[7.6.6 Propuesta de utilización de los resultados	35](#7.6.6-propuesta-de-utilización-de-los-resultados)
+[7.6.3 Construcción de las variables de entrada	39](#7.6.3-construcción-de-las-variables-de-entrada)
 
-[7.6.7 Validación funcional del proceso	36](#7.6.7-validación-funcional-del-proceso)
+[7.6.4 Generación de la predicción y clasificación de riesgo	39](#7.6.4-generación-de-la-predicción-y-clasificación-de-riesgo)
 
-[7.6.8 Explicabilidad del modelo	36](#7.6.8-explicabilidad-del-modelo)
+[7.6.5 Generación del archivo de resultados	40](#7.6.5-generación-del-archivo-de-resultados)
 
-[7.6.9 Monitoreo, actualización de datos y reentrenamiento	36](#7.6.9-monitoreo,-actualización-de-datos-y-reentrenamiento)
+[7.6.6 Propuesta de utilización de los resultados	40](#7.6.6-propuesta-de-utilización-de-los-resultados)
 
-[7.6.10 Limitaciones del despliegue	37](#7.6.10-limitaciones-del-despliegue)
+[7.6.7 Validación funcional del proceso	41](#7.6.7-validación-funcional-del-proceso)
 
-[7.6.11 Estado del despliegue	37](#7.6.11-estado-del-despliegue)
+[7.6.8 Explicabilidad del modelo	41](#7.6.8-explicabilidad-del-modelo)
 
-[**8\. CONCLUSIONES Y RECOMENDACIONES	38**](#8.-conclusiones-y-recomendaciones)
+[7.6.9 Monitoreo, actualización de datos y reentrenamiento	41](#7.6.9-monitoreo,-actualización-de-datos-y-reentrenamiento)
 
-[8.1 Conclusiones	38](#8.1-conclusiones)
+[7.6.10 Limitaciones del despliegue	42](#7.6.10-limitaciones-del-despliegue)
 
-[8.2 Recomendaciones	39](#8.2-recomendaciones)
+[7.6.11 Estado del despliegue	42](#7.6.11-estado-del-despliegue)
 
-[**9\. BIBLIOGRAFÍA	40**](#9.-bibliografía)
+[**8\. CONCLUSIONES Y RECOMENDACIONES	42**](#8.-conclusiones-y-recomendaciones)
 
-[**ANEXO	40**](#anexo)
+[8.1 Conclusiones	42](#8.1-conclusiones)
 
-[ANEXO A: Evidencias del Análisis Exploratorio de Datos	40](#anexo-a:-evidencias-del-análisis-exploratorio-de-datos)
+[8.2 Recomendaciones	44](#8.2-recomendaciones)
 
-[ANEXO B: Resultados comparativos de los modelos	45](#anexo-b:-resultados-comparativos-de-los-modelos)
+[**9\. BIBLIOGRAFÍA	44**](#9.-bibliografía)
+
+[**ANEXO	45**](#anexo)
+
+[ANEXO A: Evidencias del Análisis Exploratorio de Datos	45](#anexo-a:-evidencias-del-análisis-exploratorio-de-datos)
+
+[ANEXO B: Resultados comparativos de los modelos	50](#anexo-b:-resultados-comparativos-de-los-modelos)
 
 # 1\. INTRODUCCIÓN {#1.-introducción}
 
@@ -713,13 +719,13 @@ Una vez determinados los hiperparámetros, la Regresión Logística Optimizada f
 
 La optimización de hiperparámetros mejoró el Log Loss, el Recall, el F1, el ROC-AUC y el PR-AUC respecto al modelo candidato con hiperparámetros por defecto, a costa de una reducción marginal en Precision. La mejora más notable se dio en el Log Loss, con una reducción de 3,40 variaciones porcentuales relativos, seguida del Recall, con una mejora de 3,71 puntos porcentuales, lo que indica que la penalización l1 con un parámetro de regularización C de 0,1 produce probabilidades mejor calibradas sin sacrificar la capacidad de identificar a los clientes que efectivamente abandonan.
 
-### 7.5.4 Optimización del modelo Red Neuronal 
+### 7.5.4 Optimización del modelo Red Neuronal  {#7.5.4-optimización-del-modelo-red-neuronal}
 
 Se realizó una segunda iteración orientada a la optimización de sus hiperparámetros. La optimización se efectuó exclusivamente con los 5.475 ciclos del conjunto de entrenamiento, manteniendo los 1.335 ciclos del conjunto de prueba disponibles únicamente para el reporte final.
 
 Se utilizó la misma validación cruzada de ventana expansiva descrita en la sección 7.5.1, con cinco particiones, y una búsqueda exhaustiva por cuadrícula de 35 combinaciones de hiperparámetros sobre la arquitectura de la red, con configuraciones de 2, 3 y 4 capas ocultas de hasta 124 neuronas por capa, y sobre la tasa de aprendizaje. El preprocesamiento se mantuvo dentro del pipeline, de manera que la imputación, la transformación logarítmica de variables sesgadas y el escalado fueran ajustados únicamente con los registros correspondientes al entrenamiento de cada partición.
 
-La configuración seleccionada para la Regresión Logística Optimizada fue:
+La configuración seleccionada para la Red Neuronal Optimizada fue:
 
 * n\_train \= 5475
 
@@ -739,7 +745,7 @@ La configuración seleccionada para la Regresión Logística Optimizada fue:
 
 La configuración obtuvo un Log Loss promedio de validación cruzada de  0.6940 con una desviación estándar de 0.1133
 
-### 7.5.5  Comparación entre Red Neuronal y Red Neuronal optimizada
+### 7.5.5  Comparación entre Red Neuronal y Red Neuronal optimizada {#7.5.5-comparación-entre-red-neuronal-y-red-neuronal-optimizada}
 
 Una vez determinados los hiperparámetros, la Red Neuronal Optimizada fue entrenada y evaluada con los datos previamente mencionados.  
 ***Tabla 8\.** Comparación de métricas de evaluación entre el modelo candidato y el modelo tuneado (validación cruzada)*
@@ -755,7 +761,7 @@ Una vez determinados los hiperparámetros, la Red Neuronal Optimizada fue entren
 
 *Nota. Elaboración propia a partir de las corridas registradas en MLflow.*
 
-La búsqueda de hiperparámetros no produjo una mejora sobre la configuración por defecto: la combinación con menor Log Loss de validación cruzada entre las 15 evaluadas coincidió exactamente con los hiperparámetros por defecto de la red, dos capas ocultas de 32 y 16 neuronas con una tasa de aprendizaje de 0,001, por lo que las métricas de la Red Neuronal y la Red Neuronal Optimizada resultaron idénticas. A diferencia de la Regresión Logística, cuya optimización sí mejoró el Log Loss en 3,40 puntos porcentuales, ampliar la capacidad de la red con más capas o más neuronas por capa no aportó ninguna mejora, lo que sugiere que el volumen de datos disponible no alcanza a sostener una red más compleja que la configuración base ya utilizada.
+La búsqueda de hiperparámetros no produjo una mejora sobre la configuración por defecto: la combinación con menor Log Loss de validación cruzada entre las 35 evaluadas coincidió exactamente con los hiperparámetros por defecto de la red, dos capas ocultas de 32 y 16 neuronas con una tasa de aprendizaje de 0,001, por lo que las métricas de la Red Neuronal y la Red Neuronal Optimizada resultaron idénticas. A diferencia de la Regresión Logística, cuya optimización sí mejoró el Log Loss en 3,40 puntos porcentuales, ampliar la capacidad de la red con más capas o más neuronas por capa no aportó ninguna mejora, lo que sugiere que el volumen de datos disponible no alcanza a sostener una red más compleja que la configuración base ya utilizada.
 
 ### 7.5.6 Calibración de probabilidades de ambos modelos {#7.5.6-calibración-de-probabilidades-de-ambos-modelos}
 
@@ -763,7 +769,7 @@ Seleccionar un modelo y sus hiperparámetros mediante Log Loss favorece que las 
 
 La verificación se realizó sobre probabilidades fuera de muestra de cada modelo ya afinado, obtenidas mediante la misma validación cruzada de ventana expansiva agrupada por cliente sobre el conjunto de entrenamiento, con 4 particiones para cada uno. Se utilizaron probabilidades fuera de muestra y no las predicciones del modelo sobre los mismos datos con los que fue entrenado, ya que un modelo es sistemáticamente más confiado sobre observaciones que ya conoce.
 
-El método de calibración se eligió también por validación cruzada para cada modelo, comparando una regresión isotónica y un escalado sigmoide. En ambos casos el escalado sigmoide obtuvo el menor Log Loss de validación cruzada: 0,7301 frente a 0,8476 de la isotónica para la Regresión Logística, y 0,8344 frente a 1,1045 para la Red Neuronal.
+El método de calibración se eligió también por validación cruzada para cada modelo, comparando una regresión isotónica y un escalado sigmoide.
 
 ***Tabla 9\.** Efecto de la calibración sobre las métricas de validación cruzada (validación cruzada)*
 
@@ -821,11 +827,11 @@ La utilización de un split cronológico entre entrenamiento y prueba, que oblig
 
 Los resultados obtenidos sobre el conjunto de prueba fueron consistentes con los de la validación cruzada del modelo finalmente seleccionado, Regresión Logística Calibrada: un Log Loss de validación cruzada de 0,5611 (desviación estándar de 0,0404), frente a 0,5870 sin calibrar y 0,5895 calibrado en el conjunto de prueba, ambos dentro de una desviación estándar del valor de validación cruzada, lo que no evidenció señales de sobreajuste en el modelo seleccionado; un deterioro marcado del desempeño en el conjunto de prueba respecto a la validación cruzada sí habría constituido una señal de alerta.
 
-### 7.5.9 Análisis de sensibilidad de hiperparámetros
+### 7.5.9 Análisis de sensibilidad de hiperparámetros {#7.5.9-análisis-de-sensibilidad-de-hiperparámetros}
 
 Además de la combinación de hiperparámetros ganadora reportada en las secciones 7.5.2 y 7.5.4, se registró el Log Loss de validación cruzada obtenido por cada una de las combinaciones evaluadas en la búsqueda por cuadrícula de ambos modelos, con el fin de determinar qué tan sensible es el desempeño de cada uno a la elección de sus hiperparámetros: un rango angosto entre combinaciones indica un modelo robusto, en el que casi cualquier combinación cercana a la ganadora habría dado un resultado similar, mientras que un rango amplio indica que la combinación ganadora pudo haber sido distinta con una partición ligeramente diferente de los datos.
 
-***Tabla 9**.  Sensibilidad del Log Loss de validación cruzada frente a la grilla de hiperparámetros de cada modelo*
+***Tabla 10**.  Sensibilidad del Log Loss de validación cruzada frente a la grilla de hiperparámetros de cada modelo*
 
 | Modelo | Combinaciones evaluadas | Log Loss mínimo | Log Loss máximo | Desviación estándar |
 | :---: | :---: | :---: | :---: | :---: |
