@@ -636,9 +636,8 @@ class NeuralNetworkCandidate(ChurnModelCandidate):
                 (32, 16, 8),
                 (64, 32, 16),
                 (64, 32, 16, 8),
-                (124, 64, 32, 16)
             ],
-            "model__learning_rate": [1e-4, 5e-4, 1e-3, 5e-3, 1e-2],
+            "model__learning_rate": [5e-4, 1e-3, 5e-3, 1e-2],
         }
 
 
@@ -1169,6 +1168,8 @@ if __name__ == "__main__":
         min_train_size: int = 700,
         test_size: float = 0.20,
     ) -> None:
+        import shutil
+
         import joblib
         import matplotlib
 
@@ -1457,227 +1458,329 @@ if __name__ == "__main__":
             f"test (sin calibrar):\n{tuning_metrics}"
         )
 
-        # De los 2 modelos ya tuneados, se selecciona el que tenga mejor
-        # cv_mean_{selection_metric} -- el mismo criterio de la Fase 1 -- para
-        # continuar con la calibración de probabilidades.
-        best_name = max(
+        # Chequeo informativo, todavía no la decisión final: de los 2
+        # modelos ya tuneados, cuál tiene mejor cv_mean_{selection_metric}
+        # SIN calibrar. La Fase 3 calibra igualmente a los dos candidatos,
+        # y la decisión definitiva -- que puede terminar prefiriendo la
+        # versión calibrada o la sin calibrar de cualquiera de los dos --
+        # se toma más abajo, una vez calibrados ambos.
+        provisional_best_name = max(
             tuned, key=lambda name: tuned[name]["cv_metrics_raw"][f"cv_mean_{selection_metric}"]
         )
-        best_pipeline = tuned[best_name]["pipeline"]
-        best_params = tuned[best_name]["params"]
-        cv_metrics = tuned[best_name]["cv_metrics"]
-        tuned_metrics_raw = tuned[best_name]["test_metrics_raw"]
-        y_proba_raw = best_pipeline.predict_proba(split.X_test)[:, 1]
-        logger.success(
-            f"Modelo final seleccionado entre los modelos tuneados por validación "
-            f"cruzada ({selection_metric}): {best_name}, params={best_params}"
+        logger.info(
+            f"Mejor modelo sin calibrar por validación cruzada ({selection_metric}): "
+            f"{provisional_best_name}, params={tuned[provisional_best_name]['params']}"
         )
 
-        # --- Fase 3: calibración y umbral, ambos elegidos por CV ---
-        # El tuning anterior eligió el mejor modelo y sus hiperparámetros por
-        # discriminación y calibración conjuntas, ya que log_loss y
-        # brier_score son proper scoring rules sensibles a ambas, pero eso
-        # no garantiza que las probabilidades ya salgan bien calibradas ni
-        # que el umbral por defecto de 0.5 sea el mejor punto de corte para
-        # F1. Este paso verifica y corrige ambas cosas antes de guardar el
-        # modelo final, que es justamente lo que se usa para estimar una
-        # probabilidad de abandono y clasificar el riesgo en producción, ver
+        # --- Fase 3: calibración y umbral, ambos elegidos por CV, para CADA
+        # uno de los 2 modelos tuneados -- no solo para el finalmente
+        # elegido. Calibrar ambos permite reportar y comparar cómo se
+        # comporta cada uno bajo el mismo procedimiento, en vez de asumir
+        # que el que ganó sin calibrar seguiría ganando ya calibrado (ver
+        # secciones 7.5.6 a 7.5.9 de la monografía). El tuning ya eligió el
+        # mejor modelo y sus hiperparámetros por discriminación y
+        # calibración conjuntas, ya que log_loss y brier_score son proper
+        # scoring rules sensibles a ambas, pero eso no garantiza que las
+        # probabilidades ya salgan bien calibradas ni que el umbral por
+        # defecto de 0.5 sea el mejor punto de corte para F1. Este paso
+        # verifica y corrige ambas cosas antes de guardar el modelo final,
+        # que es justamente lo que se usa para estimar una probabilidad de
+        # abandono y clasificar el riesgo en producción, ver
         # churn_detection/modeling/predict.py.
-        logger.info(f"{best_name}: generando probabilidades out-of-fold walk-forward para calibración...")
-        oof_proba, covered = walk_forward_oof_predict_proba(
-            clone(best_pipeline), split.X_train, split.y_train, split.groups_train, wf_cv
-        )
-        # La ventana inicial de train nunca fue validación (no hay datos
-        # anteriores con los que entrenar un fold que la valide -- ver
-        # walk_forward_oof_predict_proba), así que calibración y umbral se
-        # calculan únicamente sobre las filas que sí tuvieron una
-        # probabilidad fuera de muestra real, nunca sobre todo split.X_train.
-        y_covered = split.y_train[covered]
-        groups_covered = split.groups_train[covered]
-        dates_covered = split.dates_train[covered]
-        oof_covered = oof_proba[covered]
-        logger.info(
-            f"{best_name}: {covered.sum()}/{len(covered)} ciclos de train tuvieron "
-            "probabilidad out-of-fold walk-forward (el resto es la ventana inicial, "
-            "sin datos anteriores con los que validarla)."
-        )
+        _figpath = figure_path.parent
 
-        # Folds walk-forward de nivel interno, sobre el subconjunto cubierto,
-        # para cross-validar el método de calibración y el umbral -- mismo
-        # principio que wf_cv, aplicado un nivel más abajo porque
-        # select_calibrator/select_threshold trabajan sobre oof_covered, no
-        # sobre split.X_train completo. Usa min_val_size también como piso
-        # del train, no min_train_size: lo que se ajusta acá es un
-        # calibrador de 1-2 parámetros (isotónica o sigmoid) o un barrido de
-        # umbral, no el pipeline de 11 variables -- exigirle el mismo mínimo
-        # de filas que a wf_cv deja muy pocos folds para una comparación que
-        # necesita varios para ser estable (ver select_calibrator).
-        calib_cv = WalkForwardGroupSplitter(
-            dates=dates_covered, min_val_size=min_val_size, min_train_size=min_val_size
-        )
-        calib_folds = list(calib_cv.split(groups=groups_covered))
-        logger.info(f"{best_name}: {len(calib_folds)} folds walk-forward para calibración y umbral.")
+        for name in top2_names:
+            pipeline_i = tuned[name]["pipeline"]
+            tuned_metrics_raw_i = tuned[name]["test_metrics_raw"]
+            y_proba_raw_i = pipeline_i.predict_proba(split.X_test)[:, 1]
 
-        # El método de calibración también se elige por validación cruzada
-        # (Log Loss, sobre las propias probabilidades out-of-fold), no se
-        # aplica isotónica sin más: con pocas observaciones out-of-fold en
-        # los deciles más extremos, isotónica puede sobreajustar un escalón
-        # muy pronunciado que no generaliza (ver docstring de
-        # select_calibrator, incluyendo por qué Log Loss y no Brier Score).
-        # sigmoid (Platt scaling) es más rígido y menos propenso a ese
-        # sobreajuste.
-        calibration_method, calibrator, calibration_cv_log_loss = select_calibrator(
-            oof_covered, y_covered, calib_folds
-        )
-        logger.info(
-            f"{best_name}: método de calibración elegido por validación cruzada "
-            f"(Log Loss): {calibration_method} {calibration_cv_log_loss}"
-        )
-
-        # El umbral de decisión también se elige por validación cruzada, no
-        # se deja fijo en 0.5 ni se calcula con un solo barrido sobre toda
-        # la muestra out-of-fold. Se aplica el calibrador a esas
-        # probabilidades out-of-fold para obtener la probabilidad calibrada
-        # que el modelo final realmente entregaría en cada ciclo de
-        # entrenamiento, y select_threshold promedia el punto de corte que
-        # maximiza F1 sobre los mismos folds walk-forward, en lugar de
-        # confiar en un solo barrido.
-        oof_proba_calibrated_covered = np.clip(calibrator.predict(oof_covered), 0.0, 1.0)
-        threshold = select_threshold(y_covered, oof_proba_calibrated_covered, calib_folds)
-        logger.info(
-            f"{best_name}: umbral de decisión elegido por validación cruzada walk-forward (F1): "
-            f"{threshold:.4f}"
-        )
-
-        # Métricas promedio de validación cruzada del modelo YA calibrado:
-        # se reutilizan calib_folds (los mismos folds walk-forward que
-        # generaron oof_covered), evaluando en cada fold con las
-        # probabilidades calibradas fuera de muestra y el umbral final. Es
-        # el mismo resumen (media y desviación estándar entre folds) que
-        # cross_validate_candidate y HyperparameterTuner ya reportan para
-        # elegir modelo e hiperparámetros, pero aplicado al pipeline
-        # calibrado completo en vez de al pipeline crudo.
-        oof_pred_calibrated_covered = (oof_proba_calibrated_covered >= threshold).astype(int)
-        cv_calibrated_folds: dict[str, list[float]] = {metric: [] for metric in CV_SCORING}
-        for _, val_idx in calib_folds:
-            fold_metrics = ModelEvaluator.evaluate(
-                y_covered.iloc[val_idx],
-                oof_pred_calibrated_covered[val_idx],
-                oof_proba_calibrated_covered[val_idx],
+            logger.info(
+                f"{name}: generando probabilidades out-of-fold walk-forward para calibración..."
             )
-            for metric_name, value in fold_metrics.items():
-                cv_calibrated_folds[metric_name].append(value)
-        cv_calibrated_report = "\n".join(
-            f"  {metric_name}: {np.mean(values):.4f} (+/- {np.std(values):.4f})"
-            for metric_name, values in cv_calibrated_folds.items()
-        )
+            oof_proba_i, covered_i = walk_forward_oof_predict_proba(
+                clone(pipeline_i), split.X_train, split.y_train, split.groups_train, wf_cv
+            )
+            # La ventana inicial de train nunca fue validación (no hay datos
+            # anteriores con los que entrenar un fold que la valide -- ver
+            # walk_forward_oof_predict_proba), así que calibración y umbral
+            # se calculan únicamente sobre las filas que sí tuvieron una
+            # probabilidad fuera de muestra real, nunca sobre todo
+            # split.X_train.
+            y_covered_i = split.y_train[covered_i]
+            groups_covered_i = split.groups_train[covered_i]
+            dates_covered_i = split.dates_train[covered_i]
+            oof_covered_i = oof_proba_i[covered_i]
+            logger.info(
+                f"{name}: {covered_i.sum()}/{len(covered_i)} ciclos de train tuvieron "
+                "probabilidad out-of-fold walk-forward (el resto es la ventana inicial, "
+                "sin datos anteriores con los que validarla)."
+            )
+
+            # Folds walk-forward de nivel interno, sobre el subconjunto
+            # cubierto, para cross-validar el método de calibración y el
+            # umbral -- mismo principio que wf_cv, aplicado un nivel más
+            # abajo porque select_calibrator/select_threshold trabajan sobre
+            # oof_covered, no sobre split.X_train completo. Usa
+            # min_val_size también como piso del train, no min_train_size:
+            # lo que se ajusta acá es un calibrador de 1-2 parámetros
+            # (isotónica o sigmoid) o un barrido de umbral, no el pipeline
+            # completo -- exigirle el mismo mínimo de filas que a wf_cv deja
+            # muy pocos folds para una comparación que necesita varios para
+            # ser estable (ver select_calibrator).
+            calib_cv_i = WalkForwardGroupSplitter(
+                dates=dates_covered_i, min_val_size=min_val_size, min_train_size=min_val_size
+            )
+            calib_folds_i = list(calib_cv_i.split(groups=groups_covered_i))
+            logger.info(
+                f"{name}: {len(calib_folds_i)} folds walk-forward para calibración y umbral."
+            )
+
+            # El método de calibración también se elige por validación
+            # cruzada (Log Loss, sobre las propias probabilidades
+            # out-of-fold), no se aplica isotónica sin más: con pocas
+            # observaciones out-of-fold en los deciles más extremos,
+            # isotónica puede sobreajustar un escalón muy pronunciado que no
+            # generaliza (ver docstring de select_calibrator, incluyendo por
+            # qué Log Loss y no Brier Score). sigmoid (Platt scaling) es más
+            # rígido y menos propenso a ese sobreajuste.
+            calibration_method_i, calibrator_i, calibration_cv_log_loss_i = select_calibrator(
+                oof_covered_i, y_covered_i, calib_folds_i
+            )
+            logger.info(
+                f"{name}: método de calibración elegido por validación cruzada "
+                f"(Log Loss): {calibration_method_i} {calibration_cv_log_loss_i}"
+            )
+
+            # El umbral de decisión también se elige por validación cruzada,
+            # no se deja fijo en 0.5 ni se calcula con un solo barrido sobre
+            # toda la muestra out-of-fold. Se aplica el calibrador a esas
+            # probabilidades out-of-fold para obtener la probabilidad
+            # calibrada que el modelo realmente entregaría en cada ciclo de
+            # entrenamiento, y select_threshold promedia el punto de corte
+            # que maximiza F1 sobre los mismos folds walk-forward, en lugar
+            # de confiar en un solo barrido.
+            oof_proba_calibrated_covered_i = np.clip(calibrator_i.predict(oof_covered_i), 0.0, 1.0)
+            threshold_i = select_threshold(y_covered_i, oof_proba_calibrated_covered_i, calib_folds_i)
+            logger.info(
+                f"{name}: umbral de decisión elegido por validación cruzada walk-forward (F1): "
+                f"{threshold_i:.4f}"
+            )
+
+            # Métricas promedio de validación cruzada del modelo YA
+            # calibrado: se reutilizan calib_folds_i (los mismos folds
+            # walk-forward que generaron oof_covered_i), evaluando en cada
+            # fold con las probabilidades calibradas fuera de muestra y el
+            # umbral final. Es el mismo resumen (media y desviación
+            # estándar entre folds) que cross_validate_candidate y
+            # HyperparameterTuner ya reportan para elegir modelo e
+            # hiperparámetros, pero aplicado al pipeline calibrado completo
+            # en vez de al pipeline crudo.
+            oof_pred_calibrated_covered_i = (oof_proba_calibrated_covered_i >= threshold_i).astype(int)
+            cv_calibrated_folds_i: dict[str, list[float]] = {metric: [] for metric in CV_SCORING}
+            for _, val_idx in calib_folds_i:
+                fold_metrics = ModelEvaluator.evaluate(
+                    y_covered_i.iloc[val_idx],
+                    oof_pred_calibrated_covered_i[val_idx],
+                    oof_proba_calibrated_covered_i[val_idx],
+                )
+                for metric_name, value in fold_metrics.items():
+                    cv_calibrated_folds_i[metric_name].append(value)
+            cv_calibrated_report_i = "\n".join(
+                f"  {metric_name}: {np.mean(values):.4f} (+/- {np.std(values):.4f})"
+                for metric_name, values in cv_calibrated_folds_i.items()
+            )
+            logger.success(
+                f"Métricas promedio de validación cruzada del modelo calibrado "
+                f"({name}, umbral {threshold_i:.4f}, calibrado con {calibration_method_i}):\n"
+                f"{cv_calibrated_report_i}"
+            )
+
+            calibrated_model_i = CalibratedChurnModel(
+                pipeline=pipeline_i, calibrator=calibrator_i, threshold=threshold_i
+            )
+
+            y_proba_calibrated_i = calibrated_model_i.predict_proba(split.X_test)[:, 1]
+            y_pred_calibrated_i = calibrated_model_i.predict(split.X_test)
+            tuned_metrics_calibrated_i = ModelEvaluator.evaluate(
+                split.y_test, y_pred_calibrated_i, y_proba_calibrated_i
+            )
+            logger.info(
+                f"{name}: calibración y umbral en test. Antes (umbral 0.5, sin calibrar): \n"
+                f"precision={tuned_metrics_raw_i['precision']:.4f}, "
+                f"recall={tuned_metrics_raw_i['recall']:.4f}, "
+                f"log_loss={tuned_metrics_raw_i['log_loss']:.4f}, "
+                f"brier={tuned_metrics_raw_i['brier_score']:.4f}, "
+                f"f1={tuned_metrics_raw_i['f1']:.4f}. \n"
+                f"Después (umbral {threshold_i:.4f}, calibrado con {calibration_method_i}): \n"
+                f"precision={tuned_metrics_calibrated_i['precision']:.4f}, "
+                f"recall={tuned_metrics_calibrated_i['recall']:.4f}, "
+                f"log_loss={tuned_metrics_calibrated_i['log_loss']:.4f}, "
+                f"brier={tuned_metrics_calibrated_i['brier_score']:.4f}, "
+                f"f1={tuned_metrics_calibrated_i['f1']:.4f}. \n"
+                "roc_auc y pr_auc no deberían cambiar por la calibración, ya que ambos métodos "
+                "son monótonos, pero sí pueden cambiar por el nuevo umbral en las métricas que "
+                "dependen de una clasificación dura."
+            )
+
+            with mlflow.start_run(run_name=f"{name}_calibracion"):
+                mlflow.log_params(
+                    {
+                        "model": name,
+                        "stage": "calibracion",
+                        "metodo": calibration_method_i,
+                        "threshold": threshold_i,
+                    }
+                )
+                mlflow.log_metrics(
+                    {f"cv_log_loss_{k}": v for k, v in calibration_cv_log_loss_i.items()}
+                )
+                mlflow.log_metrics({f"sin_calibrar_{k}": v for k, v in tuned_metrics_raw_i.items()})
+                mlflow.log_metrics({f"calibrado_{k}": v for k, v in tuned_metrics_calibrated_i.items()})
+                mlflow.log_metrics(
+                    {
+                        f"cv_calibrado_mean_{k}": float(np.mean(v))
+                        for k, v in cv_calibrated_folds_i.items()
+                    }
+                )
+                mlflow.log_metrics(
+                    {
+                        f"cv_calibrado_std_{k}": float(np.std(v))
+                        for k, v in cv_calibrated_folds_i.items()
+                    }
+                )
+                mlflow.sklearn.log_model(
+                    calibrated_model_i, artifact_path="model", serialization_format="pickle"
+                )
+
+            # El diagrama y la tabla de confiabilidad se construyen sobre el
+            # conjunto de EVALUACIÓN (las probabilidades out-of-fold
+            # walk-forward, oof_covered_i / oof_proba_calibrated_covered_i),
+            # no sobre el conjunto de prueba: es precisamente el mismo
+            # conjunto que select_calibrator y select_threshold ya usan para
+            # elegir el método de calibración y el umbral, así que mostrar
+            # la calibración lograda en ESE conjunto es lo que documenta
+            # honestamente la decisión tomada. El conjunto de prueba se
+            # reserva para la verificación final de la sección 7.5.8, no
+            # para elegir ni para ilustrar la calibración.
+            calibration_table_i = reliability_table(
+                y_covered_i, oof_covered_i, oof_proba_calibrated_covered_i
+            )
+
+            # El modelo finalmente elegido (best_name_final, decidido más
+            # abajo comparando también las versiones calibradas) conserva
+            # los nombres de archivo históricos (calibracion_modelo_ganador.csv,
+            # 14_calibracion.png, 12/13_matriz_confusion_*.png), ya
+            # referenciados desde dvc.yaml y el README, copiados al final de
+            # esta fase; durante el bucle, cada candidato escribe siempre a
+            # sus propios archivos sufijados con su nombre, para no asumir
+            # de antemano cuál terminará siendo el elegido.
+            calib_csv_path_i = calibration_path.parent / f"calibracion_{name}.csv"
+            calib_fig_path_i = calibration_figure_path.parent / f"15_calibracion_{name}.png"
+            cm_sin_calibrar_path_i = _figpath / f"16_matriz_confusion_sin_calibrar_{name}.png"
+            cm_calibrada_path_i = _figpath / f"17_matriz_confusion_calibrada_{name}.png"
+
+            calib_csv_path_i.parent.mkdir(parents=True, exist_ok=True)
+            calibration_table_i.to_csv(calib_csv_path_i, index=False)
+            logger.info(f"{name}: tabla de confiabilidad (conjunto de evaluación):\n{calibration_table_i}")
+
+            cal_fig_path_i = plot_reliability_diagram(
+                y_covered_i,
+                oof_covered_i,
+                oof_proba_calibrated_covered_i,
+                name,
+                calib_fig_path_i,
+                calibration_method=calibration_method_i,
+            )
+            logger.success(f"Wrote {cal_fig_path_i}")
+
+            # Matriz de confusión sin calibrar y calibrada, sobre el mismo
+            # pipeline_i / calibrated_model_i de este candidato.
+            plot_confusion_matrix(
+                pipeline_i, split.X_test, split.y_test, name, cm_sin_calibrar_path_i
+            )
+            cm_path_i = plot_confusion_matrix(
+                calibrated_model_i, split.X_test, split.y_test, name, cm_calibrada_path_i
+            )
+            logger.success(f"Wrote {cm_path_i}")
+
+            tuned[name]["calibrated_model"] = calibrated_model_i
+            tuned[name]["calibration_method"] = calibration_method_i
+            tuned[name]["threshold"] = threshold_i
+            tuned[name]["test_metrics_calibrated"] = tuned_metrics_calibrated_i
+            tuned[name]["cv_calibrated_folds"] = cv_calibrated_folds_i
+
+        # Selección final: se compara, para cada uno de los 2 candidatos
+        # tuneados, su versión SIN calibrar (cv_metrics de la Fase 2) contra
+        # su versión CALIBRADA (cv_calibrated_folds de esta fase), las
+        # cuatro por cv_mean_{selection_metric} sobre el conjunto de
+        # evaluación -- nunca sobre el conjunto de prueba. Calibrar mejora
+        # la discriminación y la calibración conjuntas en la mayoría de los
+        # casos, pero no lo garantiza (ver sección 7.5.6 de la monografía:
+        # para la Red Neuronal, el umbral de decisión resultante generalizó
+        # mal), así que la decisión de si el modelo final se guarda
+        # calibrado o no se toma con la misma evidencia que la elección
+        # entre modelos, no se asume.
+        final_candidates = {}
+        for name in top2_names:
+            final_candidates[(name, False)] = tuned[name]["cv_metrics"][f"cv_mean_{selection_metric}"]
+            final_candidates[(name, True)] = float(
+                np.mean(tuned[name]["cv_calibrated_folds"][selection_metric])
+            )
+        pick_best = min if selection_metric in _LOSS_METRICS else max
+        best_name, best_is_calibrated = pick_best(final_candidates, key=final_candidates.get)
+        final_candidates_report = {
+            f"{name}_{'calibrado' if is_calibrated else 'sin_calibrar'}": value
+            for (name, is_calibrated), value in final_candidates.items()
+        }
         logger.success(
-            f"Métricas promedio de validación cruzada del modelo calibrado "
-            f"({best_name}, umbral {threshold:.4f}, calibrado con {calibration_method}):\n"
-            f"{cv_calibrated_report}"
+            f"Modelo final seleccionado entre las 4 combinaciones de modelo/calibración "
+            f"por cv_mean_{selection_metric} sobre el conjunto de evaluación: {best_name} "
+            f"{'calibrado' if best_is_calibrated else 'sin calibrar'} "
+            f"({selection_metric}={final_candidates[(best_name, best_is_calibrated)]:.4f}). "
+            f"Comparación completa: {final_candidates_report}"
         )
 
-        calibrated_model = CalibratedChurnModel(
-            pipeline=best_pipeline, calibrator=calibrator, threshold=threshold
+        final_model = (
+            tuned[best_name]["calibrated_model"] if best_is_calibrated else tuned[best_name]["pipeline"]
         )
-
-        y_proba_calibrated = calibrated_model.predict_proba(split.X_test)[:, 1]
-        y_pred_calibrated = calibrated_model.predict(split.X_test)
-        tuned_metrics_calibrated = ModelEvaluator.evaluate(
-            split.y_test, y_pred_calibrated, y_proba_calibrated
-        )
-        logger.info(
-            f"Calibración y umbral en test. Antes (umbral 0.5, sin calibrar): \n"
-            f"precision={tuned_metrics_raw['precision']:.4f}, "
-            f"recall={tuned_metrics_raw['recall']:.4f}, "
-            f"log_loss={tuned_metrics_raw['log_loss']:.4f}, "
-            f"brier={tuned_metrics_raw['brier_score']:.4f}, "
-            f"f1={tuned_metrics_raw['f1']:.4f}. \n"
-            f"Después (umbral {threshold:.4f}, calibrado con {calibration_method}): \n"
-            f"precision={tuned_metrics_calibrated['precision']:.4f}, "
-            f"recall={tuned_metrics_calibrated['recall']:.4f}, "
-            f"log_loss={tuned_metrics_calibrated['log_loss']:.4f}, "
-            f"brier={tuned_metrics_calibrated['brier_score']:.4f}, "
-            f"f1={tuned_metrics_calibrated['f1']:.4f}. \n"
-            "roc_auc y pr_auc no deberían cambiar por la calibración, ya que ambos métodos "
-            "son monótonos, pero sí pueden cambiar por el nuevo umbral en las métricas que "
-            "dependen de una clasificación dura."
-        )
-
-        with mlflow.start_run(run_name=f"{best_name}_calibracion"):
-            mlflow.log_params(
-                {
-                    "model": best_name,
-                    "stage": "calibracion",
-                    "metodo": calibration_method,
-                    "threshold": threshold,
-                }
-            )
-            mlflow.log_metrics({f"cv_log_loss_{k}": v for k, v in calibration_cv_log_loss.items()})
-            mlflow.log_metrics({f"sin_calibrar_{k}": v for k, v in tuned_metrics_raw.items()})
-            mlflow.log_metrics({f"calibrado_{k}": v for k, v in tuned_metrics_calibrated.items()})
-            mlflow.log_metrics(
-                {
-                    f"cv_calibrado_mean_{k}": float(np.mean(v))
-                    for k, v in cv_calibrated_folds.items()
-                }
-            )
-            mlflow.log_metrics(
-                {
-                    f"cv_calibrado_std_{k}": float(np.std(v))
-                    for k, v in cv_calibrated_folds.items()
-                }
-            )
-            mlflow.sklearn.log_model(
-                calibrated_model, artifact_path="model", serialization_format="pickle"
-            )
-
-        calibration_table = reliability_table(split.y_test, y_proba_raw, y_proba_calibrated)
-        calibration_path.parent.mkdir(parents=True, exist_ok=True)
-        calibration_table.to_csv(calibration_path, index=False)
-        logger.info(f"Tabla de confiabilidad (test set):\n{calibration_table}")
-
-        cal_fig_path = plot_reliability_diagram(
-            split.y_test,
-            y_proba_raw,
-            y_proba_calibrated,
-            best_name,
-            calibration_figure_path,
-            calibration_method=calibration_method,
-        )
-        logger.success(f"Wrote {cal_fig_path}")
 
         model_output_path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(calibrated_model, model_output_path)
-        logger.success(
-            f"Mejor modelo por validación cruzada ({selection_metric}): {best_name}, "
-            f"calibrado. Guardado en {model_output_path}"
-        )
+        joblib.dump(final_model, model_output_path)
+        logger.success(f"Modelo final guardado en {model_output_path}")
 
-        _figpath = figure_path.parent
-        # Matriz de confusión / importancia de features se calculan sobre el
-        # pipeline SIN el wrapper de calibración: la calibración isotónica es
-        # monótona, así que no cambia el orden de las predicciones ni la
-        # importancia relativa de las features, solo la escala de la
-        # probabilidad -- y estas dos funciones ya saben inspeccionar un
-        # `Pipeline` con un paso "model" (ver plot_feature_importance).
-        cm_path = plot_confusion_matrix(
-            best_pipeline,
-            split.X_test,
-            split.y_test,
-            best_name,
+        # El modelo finalmente elegido conserva los nombres de archivo
+        # históricos de calibración (calibracion_modelo_ganador.csv,
+        # 14_calibracion.png, 12/13_matriz_confusion_*.png), ya referenciados
+        # desde dvc.yaml y el README, copiados desde los archivos sufijados
+        # con su propio nombre que ya se escribieron durante el bucle de la
+        # Fase 3 -- independientemente de si terminó siendo la Regresión
+        # Logística o la Red Neuronal, o si el ganador fue la versión
+        # calibrada o la versión sin calibrar.
+        shutil.copyfile(
+            calibration_path.parent / f"calibracion_{best_name}.csv", calibration_path
+        )
+        shutil.copyfile(
+            calibration_figure_path.parent / f"15_calibracion_{best_name}.png",
+            calibration_figure_path,
+        )
+        shutil.copyfile(
+            _figpath / f"16_matriz_confusion_sin_calibrar_{best_name}.png",
             _figpath / "12_matriz_confusion_sin_calibrar.png",
         )
-        cm_path = plot_confusion_matrix(
-            calibrated_model,
-            split.X_test,
-            split.y_test,
-            best_name,
+        shutil.copyfile(
+            _figpath / f"17_matriz_confusion_calibrada_{best_name}.png",
             _figpath / "13_matriz_confusion_calibrada.png",
         )
-        logger.success(f"Wrote {cm_path}")
+
+        # Importancia de features se calcula sobre el pipeline SIN el
+        # wrapper de calibración, solo para el modelo finalmente elegido: la
+        # calibración isotónica/sigmoid es monótona, así que no cambia el
+        # orden de las predicciones ni la importancia relativa de las
+        # features, solo la escala de la probabilidad -- y no aplica de la
+        # misma forma a los dos candidatos (coeficientes en un caso, pesos
+        # de una red en el otro), así que se reporta solo para el ganador.
         fi_path = plot_feature_importance(
-            best_pipeline,
+            tuned[best_name]["pipeline"],
             split.X_test,
             split.y_test,
             best_name,
