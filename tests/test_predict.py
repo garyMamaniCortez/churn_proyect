@@ -37,6 +37,48 @@ def churn_ciclos_path(tmp_path):
     return path
 
 
+def test_score_open_cycles_only_scores_cycles_due_within_the_window(trained_model_path, tmp_path):
+    rng = np.random.default_rng(5)
+    n = 6
+    data = {col: rng.uniform(0, 10, n) for col in FEATURE_COLUMNS}
+    data["persona_id"] = range(1, n + 1)
+    data["inscripcion_id"] = range(100, 100 + n)
+    # Dos ciclos antes de la ventana, tres dentro (incluyendo ambos bordes) y
+    # uno después: solo los tres dentro de [window_start, window_start + 7d]
+    # deben aparecer en el resultado.
+    data["fecha_vencimiento"] = [
+        "2026-08-28",
+        "2026-08-29",
+        "2026-08-30",
+        "2026-09-02",
+        "2026-09-06",
+        "2026-09-07",
+    ]
+    data["estado_ciclo"] = ["censurado"] * n
+    churn_ciclos_path = tmp_path / "churn_ciclos.csv"
+    pd.DataFrame(data).to_csv(churn_ciclos_path, index=False)
+
+    output_path = tmp_path / "predicciones.csv"
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "--input-path",
+            str(churn_ciclos_path),
+            "--model-path",
+            str(trained_model_path),
+            "--output-path",
+            str(output_path),
+            "--window-start",
+            "2026-08-30",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    out = pd.read_csv(output_path)
+    assert set(out["fecha_vencimiento"]) == {"2026-08-30", "2026-09-02", "2026-09-06"}
+
+
 def test_score_open_cycles_only_scores_censored_rows(trained_model_path, churn_ciclos_path, tmp_path):
     output_path = tmp_path / "predicciones.csv"
     runner = CliRunner()
@@ -49,6 +91,8 @@ def test_score_open_cycles_only_scores_censored_rows(trained_model_path, churn_c
             str(trained_model_path),
             "--output-path",
             str(output_path),
+            "--window-start",
+            "2026-08-01",
         ],
     )
 
@@ -143,6 +187,8 @@ def test_score_open_cycles_loads_a_calibrated_model_pickled_under_main(
             str(model_path),
             "--output-path",
             str(output_path),
+            "--window-start",
+            "2026-08-01",
         ],
     )
 

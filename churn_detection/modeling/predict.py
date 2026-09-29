@@ -9,6 +9,7 @@ results" piece of the project, not a second training path.
 
 from __future__ import annotations
 
+import datetime
 import sys
 from pathlib import Path
 
@@ -87,13 +88,35 @@ def score_open_cycles(
     input_path: Path = PROCESSED_DATA_DIR / "churn_ciclos.csv",
     model_path: Path = MODELS_DIR / "churn_model.joblib",
     output_path: Path = PROCESSED_DATA_DIR / "predicciones_churn.csv",
+    window_start: datetime.datetime = typer.Option(
+        datetime.datetime(2026, 8, 30),
+        formats=["%Y-%m-%d"],
+        help="Solo se puntúan ciclos cuya fecha_vencimiento cae entre esta fecha y 7 días después.",
+    ),
 ) -> None:
+    # Cada corrida puntúa una ventana operativa de una semana, no todos los
+    # ciclos abiertos a la vez: el equipo de retención trabaja la lista en
+    # tandas por semana de vencimiento, no de una sola corrida acumulada.
+    window_end = window_start + pd.Timedelta(days=7)
+
     df = pd.read_csv(input_path)
-    open_cycles = df[df["estado_ciclo"] == "censurado"].copy()
+    df["fecha_vencimiento"] = pd.to_datetime(df["fecha_vencimiento"])
+    open_cycles = df[
+        (df["estado_ciclo"] == "censurado")
+        & (df["fecha_vencimiento"] >= window_start)
+        & (df["fecha_vencimiento"] <= window_end)
+    ].copy()
     if open_cycles.empty:
-        logger.warning("No hay ciclos 'censurado' para puntuar.")
+        logger.warning(
+            "No hay ciclos 'censurado' con fecha_vencimiento entre "
+            f"{window_start.date()} y {window_end.date()} para puntuar."
+        )
         return
 
+    logger.info(
+        f"Puntuando ciclos con fecha_vencimiento entre {window_start.date()} y "
+        f"{window_end.date()} ({len(open_cycles)} ciclos censurados en esta ventana)."
+    )
     _register_train_classes_under_main()
     pipeline = joblib.load(model_path)
     open_cycles["probabilidad_churn"] = pipeline.predict_proba(open_cycles[FEATURE_COLUMNS])[:, 1]
