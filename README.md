@@ -4,498 +4,384 @@
     <img src="https://img.shields.io/badge/CCDS-Project%20template-328F97?logo=cookiecutter" />
 </a>
 
-Proyecto de deteccion de churn para clientes de un gimnasio.
+Proyecto de detección de abandono (churn) de clientes de una cadena de
+gimnasios: a partir del historial de membresías, visitas y pagos, estima la
+probabilidad de que un ciclo de membresía abierto termine en abandono, y
+genera una lista de clientes priorizada por riesgo para el equipo de
+retención.
 
-## Estado del proyecto
+Este documento explica cómo correr el proyecto de punta a punta y cómo está
+armado cada paso. Para el detalle metodológico completo (justificación de
+cada decisión, resultados y discusión) ver `MONOGRAFIA.md`.
 
-Pipeline de extracción + dataset de churn + EDA + modelo supervisado
-entrenado y puntuando clientes en riesgo, todo reproducible con DVC. La
-segmentación de clientes (clustering no supervisado) se evaluó en una fase
-anterior del proyecto pero se descartó por no aportar valor al problema de
-churn; no queda código de esa vía en el repositorio.
+## Índice
 
-## Cómo extraer los datos (ejecutar en un entorno CON acceso a la base de datos)
+- [Requisitos](#requisitos)
+- [Puesta en marcha](#puesta-en-marcha)
+- [Cómo correr el proyecto](#cómo-correr-el-proyecto-paso-a-paso)
+- [Cómo funciona cada etapa](#cómo-funciona-cada-etapa)
+- [Archivos que produce cada etapa](#archivos-que-produce-cada-etapa)
+- [Tests](#tests)
+- [Estructura del proyecto](#estructura-del-proyecto)
+- [Stack](#stack)
 
-1. `cp .env.example .env` y completar `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`,
-   `DB_PASSWORD` con las credenciales reales. `CHURN_GRACE_DAYS` es un parámetro
-   de negocio (días de gracia tras el vencimiento antes de considerar que un
-   ciclo de membresía no se renovó) — 30 es el valor usado en todo el proyecto.
-2. `pip install -r requirements.txt`
-3. `make extract-data` (o `python -m churn_detection.dataset extract-all`).
-   Esto escribe `personas.csv`, `inscripciones.csv`, `servicios.csv`,
-   `registros_acceso.csv`, `ventas_servicios.csv`, `pagos_pendientes.csv` y
-   `extraction_metadata.json` en `data/raw/`.
-4. Versionar lo extraído con DVC: `make version-data`, luego
-   `git add data/raw/*.dvc .gitignore && git commit -m "data: extracción inicial"`.
-   **Nota:** el repo ya tiene `dvc init` corrido, pero todavía no hay un remote
-   de DVC configurado (no asumí dónde quieres guardar los datos — S3, GCS, un
-   disco compartido, etc.). Configúralo con:
-   `dvc remote add -d storage <url-o-path>` antes de hacer `dvc push`.
+## Requisitos
 
-### Nota sobre `personas.csv`
+- Python ≥ 3.10
+- Acceso a la base de datos Postgres del gimnasio (solo para el paso de
+  extracción; si ya tenés `data/raw/*.csv`, no hace falta)
+- `pip`, y opcionalmente `dvc` si querés correr el pipeline completo con un
+  solo comando
+
+## Puesta en marcha
+
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env
+```
+
+Completar `.env` con las credenciales reales de la base de datos
+(`DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`). `CHURN_GRACE_DAYS`
+es un parámetro de negocio (días de gracia tras el vencimiento de una
+membresía antes de considerarla no renovada) — el proyecto usa `30`.
+
+Si no tenés acceso a la base de datos pero ya existen los CSV en
+`data/raw/`, podés saltar directamente al paso 2 de la sección siguiente.
+
+## Cómo correr el proyecto, paso a paso
+
+Cada paso es un módulo ejecutable con `python -m`. El orden importa: cada
+uno consume la salida del anterior.
+
+### 1. Extraer los datos crudos (requiere `.env` con acceso a la base de datos)
+
+```bash
+python -m churn_detection.dataset extract-all
+```
+
+Escribe `personas.csv`, `inscripciones.csv`, `servicios.csv`,
+`registros_acceso.csv`, `ventas_servicios.csv`, `pagos_pendientes.csv` y
+`extraction_metadata.json` en `data/raw/`.
+
+### 2. Construir el dataset de churn
+
+```bash
+python -m churn_detection.churn_dataset
+```
+
+Lee `data/raw/*.csv` y escribe `data/processed/churn_ciclos.csv`: una fila
+por ciclo de membresía, con sus 11 variables de comportamiento y su
+resultado (`renovado` / `churned` / `censurado`). Ver
+[Cómo funciona cada etapa](#2-dataset-de-churn-una-fila-por-ciclo-no-por-cliente)
+para el porqué de este diseño.
+
+### 3. Generar las figuras del análisis exploratorio (opcional)
+
+```bash
+python -m churn_detection.churn_plots
+```
+
+Escribe 4 figuras (`08` a `11`) en `reports/figures/`.
+
+### 4. Entrenar y comparar los modelos
+
+```bash
+python -m churn_detection.modeling.train
+```
+
+Compara 3 algoritmos, optimiza hiperparámetros, calibra probabilidades y
+guarda el modelo final en `models/churn_model.joblib`. Tarda varios minutos
+(la red neuronal es el paso más lento). Parámetros configurables — ver
+`python -m churn_detection.modeling.train --help`:
+
+| Parámetro | Default | Qué controla |
+|---|---|---|
+| `--test-size` | `0.20` | Proporción de ciclos reservada para el conjunto de prueba (split cronológico) |
+| `--selection-metric` | `log_loss` | Métrica usada para elegir modelo, hiperparámetros y estado de calibración |
+| `--min-val-size` | `100` | Tamaño mínimo de una ventana de validación en la validación cruzada walk-forward |
+| `--min-train-size` | `700` | Tamaño mínimo de entrenamiento para que una partición walk-forward cuente |
+
+### 5. Puntuar los ciclos abiertos
+
+```bash
+python -m churn_detection.modeling.predict --window-start 2026-08-30
+```
+
+Carga `models/churn_model.joblib` y puntúa los ciclos `censurado` (sin
+resultado todavía) cuya `fecha_vencimiento` cae entre `--window-start` y esa
+fecha más 7 días — la ventana operativa que el equipo de retención trabaja
+en esa semana. Escribe `data/processed/predicciones_churn.csv`, ordenado de
+mayor a menor probabilidad de abandono, con el riesgo clasificado en
+bajo/medio/alto.
+
+### Alternativa: correr todo con DVC
+
+```bash
+dvc repro
+```
+
+`dvc.yaml` encadena los pasos 2 a 5 (no el 1, que requiere credenciales y no
+es determinístico) y solo recalcula lo que cambió. Para versionar:
+
+```bash
+git add dvc.yaml dvc.lock data/processed/.gitignore reports/figures/.gitignore models/.gitignore
+git commit -m "churn: pipeline completo"
+dvc push   # requiere un remote configurado: dvc remote add -d storage <url-o-path>
+```
+
+Los datos crudos (`data/raw/*.csv`) se versionan aparte con `dvc add` y el
+pipeline los referencia como dependencias de solo lectura. **Nota:** algunos
+de los artefactos nuevos descritos en la tabla de la sección siguiente
+(análisis de sensibilidad, calibración y matrices por candidato) todavía no
+están declarados como `outs` en `dvc.yaml`; se generan igual al correr
+`train.py`, pero `dvc repro` no los trackea uno por uno todavía.
+
+## Cómo funciona cada etapa
+
+### 1. Extracción de datos
+
+`churn_detection/dataset.py` lee la base operativa del gimnasio (capa de
+acceso en `churn_detection/data/`: interfaz `ClientDataRepository` +
+implementación Postgres, para no acoplar el resto del proyecto a un motor de
+base de datos concreto) y vuelca las tablas relevantes a CSV en `data/raw/`.
 
 Por diseño, la extracción de `personas` **excluye** `ci`, `telefono` y
-`huella_digital` (huella biométrica) — no aportan valor predictivo para churn
-y no tiene sentido versionarlos en CSVs planos. Solo se usa `persona_id` como
-llave.
+`huella_digital` — no aportan valor predictivo y no tiene sentido
+versionarlos en CSVs planos. Solo se usa `persona_id` como llave.
 
-### Corrección de calidad de datos: ventana de tracking confiable
+### 2. Dataset de churn: una fila por ciclo, no por cliente
 
-El módulo de registro de accesos del gimnasio no funcionó de forma confiable
-antes de febrero-2026 (confirmado por el cliente, y respaldado por los datos:
-enero-2026 tiene solo 5 registros de acceso en total, y las inscripciones que
-empezaron antes de esa fecha muestran 61% "nunca usadas" vs. 10% desde
-febrero en adelante). Sin esta corrección, ese hueco de datos se leería como
-"el cliente nunca vino", cuando en realidad es "el sistema no lo registró".
-Se agregó `config.RELIABLE_ACCESS_TRACKING_SINCE = 2026-02-01`; toda feature
-derivada de `registros_acceso` (y el cálculo de `porcentaje_uso_membresia`,
-que depende de `ingresos_disponibles`) excluye —no imputa a 0— todo lo
-anterior a esa fecha.
-
-## Dataset de churn: una fila por ciclo de membresía, no por cliente
-
-`churn_detection/churn_dataset.py` (`ChurnCycleDatasetBuilder`) construye el
+`churn_detection/churn_dataset.py` (`ChurnCycleDatasetBuilder`) arma el
 dataset de entrenamiento.
 
 **Por qué una fila por ciclo y no por cliente:** usar la última membresía de
-cada cliente como única observación es circular. Si el cliente renovó, esa
+cada cliente como única observación es circular — si el cliente renovó, esa
 renovación pasa a ser su membresía "más reciente", así que la que se estaba
-evaluando nunca puede resolver en "renovó" bajo esa definición, solo en
-"abandonó" o "todavía sin resolver". Un modelo entrenado así jamás vería un
-ejemplo positivo de retención. La solución: cada inscripción de tipo
-membresía que un cliente tuvo es su propia observación. Un cliente con 3
-membresías a lo largo del tiempo aporta hasta 3 filas.
+evaluando nunca puede resolver en "renovó". Cada inscripción de tipo
+membresía que un cliente tuvo es su propia observación; un cliente con 3
+membresías aporta hasta 3 filas.
 
 **Sin fuga de datos:** cada fila usa `fecha_vencimiento` de ESA membresía
-como corte. Todas sus features (check-ins, gasto, uso, antigüedad) se calculan
-únicamente con información con fecha anterior o igual a ese corte. Nada de lo
-que pasó durante o después del ciclo siguiente se usa para predecir el
-resultado de este.
+como corte. Todas sus features (check-ins, gasto, uso, antigüedad) se
+calculan únicamente con información de fecha anterior o igual a ese corte.
 
-**Label y censura**, por ciclo:
+**Resultado de cada ciclo:**
 - `renovado` (`churn_label=0`): hubo una inscripción de membresía siguiente
-  que empezó dentro de `CHURN_GRACE_DAYS` días tras el vencimiento de esta.
-  Los pases de un solo día en el medio no cuentan como renovación.
+  dentro de `CHURN_GRACE_DAYS` días tras el vencimiento.
 - `churned` (`churn_label=1`): no hubo renovación a tiempo, y ya pasó
   suficiente tiempo como para saberlo con certeza.
 - `censurado` (`churn_label=NaN`): es el último ciclo conocido del cliente y
-  todavía está dentro de la ventana de gracia, no se sabe el resultado
-  todavía. Se excluye del entrenamiento; es exactamente el conjunto de
-  clientes a los que se les aplicaría el modelo en producción.
+  todavía está dentro de la ventana de gracia. Se excluye del entrenamiento
+  — es exactamente el conjunto de clientes que `predict.py` puntúa.
 
-**Resultado real (`CHURN_GRACE_DAYS=30`):** 8,573 ciclos de membresía, de los
-cuales 6,750 (78.7%) tienen resultado conocido: 3,548 renovaron, 3,202 no.
-**Tasa de churn entre los ciclos con resultado: ~47.4%.** (Estos números
-avanzan levemente cada vez que se corre el pipeline en una fecha distinta,
-ver nota de reproducibilidad temporal más abajo.)
-
-Como control de calidad: comparando el promedio de las features entre ciclos
-`renovado` y `churned`, todas las diferencias van en la dirección esperada
-(los que abandonan tienen menos antigüedad, menos uso de membresía, menos
-ritmo reciente y menos gasto), señal de que el dataset es coherente antes de
-modelar.
+**Corrección de calidad de datos:** el registro de accesos no funcionó de
+forma confiable antes de febrero de 2026 (confirmado por el cliente y por
+los datos: enero-2026 tiene solo 5 registros de acceso en total).
+`config.RELIABLE_ACCESS_TRACKING_SINCE = 2026-02-01` hace que toda feature
+derivada de check-ins **excluya** —no impute a 0— lo anterior a esa fecha,
+para no confundir "no hay registro" con "el cliente no vino".
 
 Salida: `data/processed/churn_ciclos.csv`, con columnas de identidad
 (`persona_id`, `inscripcion_id`, fechas), `estado_ciclo`, `churn_label`, y 11
 features de comportamiento (antigüedad, uso de membresía, recencia,
-frecuencia, horario, patrón semanal, gasto y su tendencia reciente, número de
-inscripciones, ritmo reciente vs. histórico, y regularidad de visitas).
+frecuencia, horario, patrón semanal, gasto y su tendencia reciente, número
+de inscripciones, ritmo reciente vs. histórico, y regularidad de visitas).
 
-Ninguna columna supera el 40% de nulos; el peor caso ronda el 27%
-(`cv_gap_visitas`, porque requiere al menos 3 check-ins para calcularse). Los
-nulos restantes se dejan tal cual a propósito — decidir cómo tratarlos es una
-decisión de modelado, no de esta etapa.
+### 3. Análisis exploratorio
 
-## EDA del dataset de churn
+`churn_detection/churn_plots.py` genera 4 figuras (`08`-`11` en
+`reports/figures/`): distribución de `estado_ciclo`, nulos por columna,
+distribución de cada feature separada por `renovado` vs. `churned`, y
+correlación entre features.
 
-`churn_detection/churn_plots.py` (`ChurnEDAFigureGenerator`) genera 4 figuras
-propias (`08` a `11` en `reports/figures/`):
-- Distribución de `estado_ciclo` (41.4% renovado, 37.0% churned, 21.6%
-  censurado).
-- Nulos por columna.
-- **Distribución de cada feature separada por `renovado` vs. `churned`**: la
-  más útil de las cuatro, muestra directamente qué variables separan a quien
-  se queda de quien se va. `porcentaje_uso_membresia`, `n_inscripciones_total`
-  y `ratio_actividad_reciente` muestran una separación visual clara;
-  `hora_promedio_checkin`, `cv_gap_visitas` y `pct_visitas_fin_de_semana` se
-  superponen casi por completo, señal de que aportan poco al modelo.
-- Correlación entre features.
+### 4. Entrenamiento (`churn_detection/modeling/train.py`)
 
-## Entrenamiento del modelo
+El split train/test es **cronológico** (`ChronologicalSplitter`): train solo
+contiene ciclos resueltos antes de una fecha de corte, test solo ciclos
+resueltos después, para medir desempeño sobre datos genuinamente futuros. Un
+mismo cliente puede aparecer a ambos lados (ciclo temprano en train, uno
+posterior en test) porque `persona_id` nunca es una feature.
 
-`churn_detection/modeling/train.py` compara 3 modelos candidatos (patrón de
-clase-por-candidato: `ChurnModelCandidate` ABC + una subclase por modelo), con
-split train/test **cronológico** (`ChronologicalSplitter`): train solo
-contiene ciclos cuyo resultado se resolvió (`fecha_vencimiento`) antes de una
-fecha de corte, test solo ciclos resueltos después. Esto demuestra desempeño
-sobre datos genuinamente futuros, algo que un split agrupado por
-`persona_id` pero sin orden temporal no garantiza (podía dejar ciclos más
-recientes en train que en test). Un mismo cliente puede seguir apareciendo a
-ambos lados (su ciclo temprano en train, uno posterior en test) porque
-`persona_id` nunca es una feature; ese `persona_id` sí se conserva para que la
-validación cruzada interna (selección de modelo y tuning, ver más abajo) no
-reparta los ciclos de un mismo cliente entre folds. Todo el entrenamiento
-queda con tracking en **MLflow** (experimento `churn_gimnasio`, backend
-SQLite local en `mlflow.db`).
-
-**Preprocesamiento aplicado, por modelo** (no es el mismo para los tres, y es
-así a propósito):
+**Preprocesamiento, por modelo** (no es el mismo para los tres, a propósito):
 
 | | Imputación de nulos | Escalado | Log1p en features asimétricas |
 |---|---|---|---|
-| Regresión logística | mediana | `StandardScaler` | sí (`SKEWED_FEATURES`) |
-| Red neuronal (TensorFlow) | mediana | `StandardScaler` | sí (`SKEWED_FEATURES`) |
+| Regresión logística | mediana | `StandardScaler` | sí |
+| Red neuronal (TensorFlow/Keras) | mediana | `StandardScaler` | sí |
 | Hist Gradient Boosting | no, usa `NaN` nativo | no | no |
 
-No se hizo eliminación de outliers como paso de modelado: los valores
-extremos que aparecen en `churn_ciclos.csv` (por ejemplo, `monto_total_gastado`
-hasta $1,919, o `tenure_dias` hasta 696 días por planes anuales largos) se
-verificaron manualmente y son clientes reales, no errores de carga. El único
-outlier real de todo el proyecto (una cuenta genérica de recepción usada para
-pases de día, id=32) ya se excluye en `config.EXCLUDED_PERSONA_IDS`, antes de
-llegar a este dataset.
+**Validación cruzada: ventana expansiva por mes, no K-Fold aleatorio.**
+Dentro del train, la selección de modelo, el tuning de hiperparámetros y la
+calibración usan `WalkForwardGroupSplitter`: cada partición entrena solo con
+los ciclos resueltos hasta un mes calendario y valida con el mes siguiente,
+purgando del entrenamiento a cualquier cliente presente en el mes de
+validación. Un K-Fold aleatorio (incluso agrupado por cliente) no evita que
+una partición de validación de un mes temprano se evalúe con un modelo
+entrenado también con meses posteriores — exactamente lo que el split
+cronológico externo ya evita, pero sin protección un nivel más abajo. En una
+comparación con el esquema anterior (K-Fold aleatorio), Hist Gradient
+Boosting ganaba; bajo ventana expansiva pasa a ser el peor de los tres, lo
+que indica que su ventaja aparente dependía de mezclar información de meses
+futuros en el entrenamiento — el motivo concreto por el que se cambió de
+esquema.
 
-### Por qué volvió la regresión logística (como baseline, no como reemplazo)
+**Fase 1 — selección de candidatos:** los 3 algoritmos (Regresión Logística,
+Hist Gradient Boosting, Red Neuronal) se validan con 5 particiones walk-forward
+sobre el train set. Se retienen los **2 mejores** por `log_loss` medio de
+validación cruzada para la siguiente fase (actualmente: Regresión Logística y
+Red Neuronal; Hist Gradient Boosting queda descartado).
 
-En una iteración anterior se había sacado la regresión logística del proyecto
-para meter la red neuronal, dejando la comparación entre Random Forest, Hist
-Gradient Boosting y la red neuronal: tres modelos "complejos" entre sí, sin
-ningún modelo de referencia simple. Al revisar la monografía contra una lista
-de errores frecuentes en proyectos de Ciencia de Datos, esto encajaba
-directamente en uno de ellos: *no definir un modelo baseline*, es decir, no
-tener cómo demostrar que la complejidad extra de los otros modelos realmente
-se traduce en mejor desempeño. Se sacó **Random Forest** (quedaba redundante
-con Hist Gradient Boosting, ambos basados en árboles) y volvió la **regresión
-logística**, esta vez explícitamente como el modelo de referencia contra el
-que se comparan los otros dos.
+**Fase 2 — tuning + análisis de sensibilidad:** cada uno de los 2 candidatos
+retenidos se afina por separado (`HyperparameterTuner` sobre `GridSearchCV`,
+mismo `WalkForwardGroupSplitter`). Además de la combinación ganadora, se
+guarda el `log_loss` de **todas** las combinaciones probadas
+(`sensibilidad_hiperparametros_<modelo>.csv`), para saber qué tan sensible es
+cada modelo a la elección de sus hiperparámetros — un rango angosto indica un
+modelo robusto, uno amplio indica que la combinación ganadora pudo depender
+de la partición de datos.
 
-### Red neuronal
+**Fase 3 — calibración, para los 2 candidatos tuneados:** seleccionar por
+`log_loss` favorece que las probabilidades salgan razonablemente calibradas,
+pero no lo garantiza, así que se verifica y corrige explícitamente:
 
-`KerasBinaryClassifier` es un wrapper propio (no `scikeras`, para no sumar una
-dependencia extra) que hace que un modelo de Keras se comporte como cualquier
-estimador de scikit-learn (`.fit`, `.predict`, `.predict_proba`), para poder
-meterlo en el mismo `Pipeline` que los demás candidatos. Arquitectura: red
-densa feed-forward de 2 capas ocultas (32 y 16 neuronas, activación ReLU),
-salida sigmoide, optimizador Adam, 40 épocas.
+1. Se generan probabilidades **out-of-fold** de cada modelo ya afinado sobre
+   el train set (nunca las predicciones in-sample: un modelo es
+   sistemáticamente más confiado sobre datos que ya vio).
+2. Se elige entre regresión isotónica y escalado sigmoide por validación
+   cruzada (`log_loss`, no `brier_score` — este último no fue lo bastante
+   sensible al sobreajuste de isotónica en los deciles de mayor riesgo,
+   donde hay pocas observaciones).
+3. El umbral de decisión se elige por validación cruzada maximizando **F1**
+   (no `log_loss`: el `log_loss` no depende del umbral, porque evalúa la
+   probabilidad cruda, no una etiqueta dura — maximizar F1 es el criterio
+   correcto justamente porque F1 sí depende de dónde se corta).
 
-**Bug encontrado y corregido al implementarla:** un modelo de Keras crudo
-**no es serializable con joblib/pickle** por defecto (tiene estado interno de
-TensorFlow que no se puede picklear tal cual). Es el mismo tipo de bug que ya
-nos había pasado con la regresión logística la primera vez (ahí era una
-función closure local). Se corrigió implementando `__getstate__`/`__setstate__`
-en `KerasBinaryClassifier`: al picklear, el modelo se guarda con el formato
-nativo de Keras a un archivo temporal y se convierte a bytes; al despicklear,
-se reconstruye desde esos bytes. Cubierto por
-`test_neural_network_pipeline_is_picklable`, siguiendo el mismo patrón de
-"agregar el test que hubiera atrapado esto" que ya usamos antes.
+Los diagramas y tablas de confiabilidad de esta fase se construyen sobre el
+**conjunto de evaluación** (las probabilidades out-of-fold), no sobre el
+conjunto de prueba: es la misma evidencia que ya se usó para elegir el
+método de calibración y el umbral.
 
-**Otro bug corregido en el camino:** la transformación `log1p` de las
-variables asimétricas estaba originalmente definida como closure local, lo
-cual tampoco es picklable. Se corrigió moviéndola a una clase a nivel de
-módulo (`_Log1pSkewedColumns`), compartida hoy entre la regresión logística y
-la red neuronal.
+**Selección final: 4 combinaciones, no 2.** Calibrar mejora el `log_loss`
+en ambos modelos, pero no garantiza que el que ganaba sin calibrar siga
+ganando calibrado, así que la decisión final compara las 4 combinaciones de
+modelo × estado de calibración por `log_loss` de validación cruzada:
 
-### Selección de modelo y tuning, ambos por validación cruzada
+| Modelo | Calibrado | Log Loss (validación cruzada) |
+|---|---|---|
+| Regresión Logística | No | 0,6045 |
+| **Regresión Logística** | **Sí** | **0,5611** |
+| Red Neuronal | No | 0,6940 |
+| Red Neuronal | Sí | 0,6232 |
 
-Los 3 candidatos ya no se comparan ajustándolos una vez y mirando su
-desempeño en el test set (eso usaría el test set para elegir un ganador, y
-después otra vez para "reportar" ese mismo ganador -- el mismo dato
-respaldando dos afirmaciones distintas). En cambio, cada candidato se valida
-con `StratifiedGroupKFold` (`cross_validate_candidate`) **solo sobre el
-train set**, y el ganador se elige por la métrica media de validación
-(`cv_mean_<selection_metric>`). El ajuste sobre todo el train + evaluación en
-test que también se ve en los logs es puramente descriptivo (la curva ROC
-comparativa, la tabla `comparacion_modelos_churn.csv`), nunca decide nada.
+La Regresión Logística Calibrada gana, y es el modelo guardado en
+`models/churn_model.joblib`. Sobre el conjunto de prueba (tocado una sola
+vez, solo para reportar, nunca para decidir): `log_loss=0,5895`,
+`brier_score=0,1965`, `roc_auc=0,7985`, `precision=0,6179`, `recall=0,6696`
+al umbral `0,2136`.
 
-El tuning de hiperparámetros del ganador (`HyperparameterTuner`, que envuelve
-`GridSearchCV`) sigue el mismo principio un nivel más abajo: usa el mismo
-`StratifiedGroupKFold` agrupado por `persona_id`, y el `refit` también se
-decide con la métrica de validación, nunca con el test set. Agrupar por
-`persona_id` en ambos casos evita que los folds de validación cruzada
-mezclen ciclos del mismo cliente: si eso pasara, una combinación de
-hiperparámetros (o un candidato) podría verse mejor solo porque el modelo
-memorizó parcialmente a ese cliente, no porque generalice mejor.
+El modelo final guardado es siempre el ganador real de esta comparación de 4
+combinaciones, sin importar cuál sea: los archivos de calibración y matriz
+de confusión del ganador se copian a los nombres "canónicos"
+(`calibracion_modelo_ganador.csv`, `14_calibracion.png`,
+`12_matriz_confusion_sin_calibrar.png`, `13_matriz_confusion_calibrada.png`)
+al final de la corrida; el candidato no elegido queda igual en sus propios
+archivos sufijados con su nombre, solo para comparación.
 
-**Métrica de selección: `log_loss`, no `roc_auc`.** El objetivo del proyecto
-es estimar una *probabilidad* de abandono, no solo ordenar clientes de más a
-menos riesgosos. ROC-AUC, PR-AUC y recall miden exclusivamente
-discriminación: son invariantes a cualquier recalibración monótona de la
-probabilidad predicha, así que un modelo puede tener ROC-AUC alto y seguir
-prediciendo "0.95" para clientes que en realidad abandonan el 60% de las
-veces. `log_loss` (y `brier_score`, que también se reporta) son *proper
-scoring rules*: solo mejoran cuando la probabilidad predicha se acerca a la
-tasa real observada, así que elegir el modelo/hiperparámetros que minimizan
-`log_loss` en validación favorece directamente el objetivo del proyecto. Ver
-"Calibración de probabilidades" más abajo para cómo se verifica y corrige
-esto de forma explícita, no solo se selecciona por ello.
+Por no exponer `coef_` ni `feature_importances_` de forma consistente entre
+los 3 candidatos durante la Fase 1, y porque el modelo final sí es lineal,
+la importancia de variables (`14_importancia_features.png`) usa los
+coeficientes de la Regresión Logística ganadora. Variables con mayor peso:
+`n_inscripciones_total` (negativo — más inscripciones acumuladas, menor
+riesgo), `tenure_dias` y `recencia_dias` (positivos — más antigüedad y más
+días sin visitar, mayor riesgo), `porcentaje_uso_membresia` (negativo).
 
-Cada candidato declara su propia grilla vía `param_grid()` (patrón
-Open/Closed, igual que `build_pipeline()`): regresión logística busca sobre
-`C` (4 valores), Hist Gradient Boosting sobre `learning_rate`, `max_depth` y
-`max_iter` (27 combinaciones), y la red neuronal sobre `hidden_units` y
-`learning_rate` (4 combinaciones, deliberadamente chico porque cada
-combinación reentrena la red desde cero en cada fold).
-
-**Bug real encontrado al correr esto por primera vez:** `GridSearchCV` con
-`scoring="roc_auc"` fallaba para la red neuronal con el error *"Got a
-regressor with response_method=predict_proba"*. La causa: `KerasBinaryClassifier`
-estaba declarada como `class KerasBinaryClassifier(BaseEstimator,
-ClassifierMixin)`, y en scikit-learn 1.8 el orden de las clases base importa
-para que el sistema de tags (`__sklearn_tags__`) resuelva correctamente vía
-MRO. Con `BaseEstimator` primero, su propia implementación de
-`__sklearn_tags__` se ejecuta antes que la de `ClassifierMixin` y nunca
-incorpora `estimator_type="classifier"`, así que `is_classifier(...)` daba
-`False` para un modelo que evidentemente es un clasificador. Se corrigió
-invirtiendo el orden a `class KerasBinaryClassifier(ClassifierMixin,
-BaseEstimator)` (el orden que la propia documentación de scikit-learn
-recomienda y que fácilmente se pasa por alto), con dos tests dedicados que lo
-cubren: uno directo sobre `is_classifier()` y otro de integración corriendo
-`HyperparameterTuner` de punta a punta sobre la red neuronal.
-
-**Resultados de la corrida con la metodología corregida** (split cronológico,
-selección por validación cruzada): Hist Gradient Boosting ganó la comparación
-de los 3 candidatos por `log_loss` en CV, aunque el desempeño de discriminación
-(Accuracy) fue prácticamente idéntico entre los tres (~0.714-0.715). Tras el
-tuning (`StratifiedGroupKFold(n_splits=5)`, 27 combinaciones,
-`learning_rate=0.05, max_depth=5, max_iter=100`):
-
-| Métrica | CV media | CV desv. estándar | Test (sin calibrar) |
-|---|---|---|---|
-| Accuracy | 0.7249 | 0.0148 | 0.7784 |
-| Precision | 0.7126 | 0.0097 | 0.7158 |
-| Recall | 0.7856 | 0.0389 | 0.6422 |
-| F1 | 0.7469 | 0.0191 | 0.6770 |
-| ROC-AUC | 0.8040 | 0.0162 | 0.8255 |
-| PR-AUC | 0.8038 | 0.0155 | 0.7150 |
-| Brier Score | 0.1800 | 0.0074 | 0.1623 |
-| Log Loss | 0.5350 | 0.0175 | 0.4996 |
-
-Sobre ese mismo test set, la Red Neuronal (no elegida, por perder en `log_loss`
-de CV) obtuvo ROC-AUC 0.8415, PR-AUC 0.6879 y Log Loss 0.4965 -- ligeramente
-mejor que Hist Gradient Boosting en esa partición puntual. Esto no es un error
-de selección: es la varianza esperable de un único test set frente a un
-promedio de validación cruzada, que es justamente la razón de elegir por CV
-y no por el resultado de una sola partición (ver `cv_final_detalle_por_fold.csv`
-para el detalle por fold).
-
-### Calibración de probabilidades (método elegido por validación cruzada)
-
-Seleccionar por `log_loss`/`brier_score` ayuda a que el ganador tienda a
-salir bien calibrado, pero no lo garantiza -- así que se verifica y se
-corrige explícitamente, en un paso aparte, antes de guardar el modelo final:
-
-1. Se generan probabilidades **out-of-fold** del modelo ganador ya afinado
-   sobre el train set (`cross_val_predict` con el mismo `StratifiedGroupKFold`
-   agrupado por `persona_id`). Deben ser out-of-fold y no las predicciones
-   in-sample del modelo: un modelo es sistemáticamente más confiado sobre
-   datos que ya vio, así que calibrar contra sus propias predicciones
-   in-sample solo le enseñaría a un calibrador a reproducir ese exceso de
-   confianza, no a corregirlo.
-2. **`select_calibrator` elige entre isotónica y sigmoid (Platt scaling) por
-   validación cruzada**, no aplica isotónica sin más. La primera versión de
-   este paso sí lo hacía, y el resultado real de una corrida fue que la
-   calibración isotónica *empeoró* el Brier Score (0.1623 → 0.1635) y el Log
-   Loss (0.4996 → 0.5061) en el test set: la tabla de confiabilidad mostró
-   que, en el decil de mayor riesgo, isotónica predijo 0.968 cuando la tasa
-   observada era 0.797 -- muy pocas observaciones out-of-fold caen en ese
-   extremo, y la flexibilidad de isotónica (puede ajustar un escalón
-   arbitrario) sobreajustó ese puñado de puntos en vez de generalizar.
-   Una segunda versión comparó isotónica vs. sigmoid por **Brier Score**
-   cross-validado (agrupado por cliente, repetido 5 veces) y **isotónica
-   siguió ganando** (0.1803 vs. 0.1809): el decil problemático es una
-   fracción tan pequeña del train set que un promedio de error cuadrático
-   casi no lo nota. Solo al cambiar el criterio de comparación a **Log
-   Loss** -- que penaliza de forma logarítmica una probabilidad confiada y
-   equivocada, exactamente lo que pasa en ese decil -- la comparación se dio
-   vuelta (isotónica 0.5399 vs. sigmoid 0.5385) y `select_calibrator` eligió
-   sigmoid. En la corrida más reciente, con sigmoid, el Brier Score del test
-   set bajó a 0.1607 y el Log Loss a 0.4955 (mejoras reales, no un
-   empeoramiento como con isotónica sin más). Es la misma razón por la que
-   el proyecto ya usaba Log Loss, y no ROC-AUC, para elegir modelo e
-   hiperparámetros (sección de arriba): resultó ser también el criterio
-   correcto para elegir el propio método de calibración.
-3. El modelo final guardado en `models/churn_model.joblib`
-   (`CalibratedChurnModel`) envuelve el pipeline afinado + el calibrador
-   elegido: `predict_proba` ya devuelve la probabilidad calibrada, no la cruda.
-
-La evidencia queda en dos artefactos, ambos sobre el test set held-out y
-comparando antes/después de calibrar: `reports/figures/14_calibracion.png`
-(diagrama de confiabilidad: probabilidad media predicha vs. tasa de churn
-observada, por decil) y `data/processed/calibracion_modelo_ganador.csv` (la
-misma comparación en tabla). `roc_auc`/`pr_auc` no cambian entre la versión
-cruda y la calibrada, como se espera de una transformación monótona (0.8255 /
-0.7150 en ambas); `brier_score` y `log_loss` sí mejoraron con sigmoid.
-
-**Bug real encontrado al conectar esto con `predict.py`:** `models/
-churn_model.joblib` se genera corriendo `train.py` como script (`python -m
-churn_detection.modeling.train`), lo que hace que Python trate esa ejecución
-de `train.py` como el módulo `"__main__"` -- por lo que `CalibratedChurnModel`
-(y las demás clases propias del archivo) quedan *pickleadas* como si vivieran
-en `"__main__"`, no en su ruta real. `predict.py`, corrido después como su
-propio proceso (`python -m churn_detection.modeling.predict`), tiene su
-*propio* `"__main__"` -- que nunca definió esas clases -- así que un
-`joblib.load` directo fallaba con `AttributeError: Can't get attribute
-'CalibratedChurnModel' on <module '__main__' ...>`. Se corrigió con
-`_register_train_classes_under_main()` en `predict.py`: antes de cargar el
-artefacto, registra las clases reales (importadas normalmente) bajo
-`sys.modules["__main__"]` de ese proceso, para que la búsqueda de `pickle`
-las encuentre. Cubierto por
-`test_score_open_cycles_loads_a_calibrated_model_pickled_under_main`, que
-reproduce el bug pickleando bajo `"__main__"` a propósito antes de cargar.
+Todo el entrenamiento queda registrado en **MLflow** (experimento
+`churn_gimnasio`, backend SQLite local en `mlflow.db`).
 
 **Nota sobre reproducibilidad temporal:** `churn_dataset.py` usa la fecha
 actual como corte para decidir qué ciclos están `censurado` vs. ya resueltos,
-así que volver a correr `dvc repro` en una fecha distinta puede mover
-ligeramente algunos ciclos de `censurado` a `churned` (los que ya agotaron su
-ventana de gracia desde la última corrida) y cambiar las métricas en un
-margen pequeño. No es no determinismo del modelo, es que el "hoy" del
-snapshot efectivamente avanza.
+así que volver a correr el pipeline en una fecha distinta puede mover
+ligeramente algunos ciclos de `censurado` a `churned` y cambiar las métricas
+en un margen pequeño. No es falta de determinismo del modelo: es que el
+"hoy" del snapshot avanza.
 
-Como ese modelo no expone `feature_importances_` ni `coef_`, la importancia
-de variables (`reports/figures/13_*.png`) se calculó con **permutation
-importance** (`sklearn.inspection.permutation_importance`, caída de ROC-AUC al
-mezclar cada columna), un método universal que también funciona para
-cualquiera de los otros dos modelos. Top variables: `n_inscripciones_total`,
-`recencia_dias`, `tenure_dias`, `porcentaje_uso_membresia`, coherente con el
-EDA por separación visual.
+### 5. Scoring de clientes en riesgo (`churn_detection/modeling/predict.py`)
 
-`Hist Gradient Boosting` se incluyó a propósito porque maneja `NaN`
-nativamente, sin imputar, algo relevante dado que buena parte de la
-"faltante" en estos datos es información real (falta de tracking confiable),
-no ruido aleatorio.
+Puntúa únicamente los ciclos `censurado` cuya `fecha_vencimiento` cae dentro
+de una ventana operativa de 7 días (`--window-start`, por defecto
+`2026-08-30`) — el equipo de retención trabaja la lista semana a semana, no
+el total acumulado de ciclos abiertos.
 
-## Scoring de clientes en riesgo
+Los niveles de riesgo (bajo/medio/alto) se calculan por **terciles de la
+propia distribución de probabilidades del lote puntuado en esa corrida**, no
+con puntos de corte fijos como 0,33/0,66: "alto" es el tercio más riesgoso
+de los clientes de ESA corrida, no un valor absoluto de probabilidad. Si el
+lote es demasiado chico o uniforme para tres terciles distintos, el proceso
+cae a dos niveles (bajo/alto) alrededor de la mediana, con una advertencia
+en el log.
 
-`churn_detection/modeling/predict.py` puntúa únicamente los ciclos
-`censurado` (1,823 clientes sin resultado resuelto todavía, al último corte)
-y los clasifica en riesgo bajo/medio/alto (733 alto, 364 medio, 726 bajo).
 `data/processed/predicciones_churn.csv` queda ordenado de mayor a menor
 probabilidad de abandono, listo para que el equipo de retención lo use como
-lista de priorización.
+lista de priorización: trabajar primero "alto", después "medio", y "bajo"
+según la capacidad de contacto disponible.
 
-## Pipeline de DVC
+## Archivos que produce cada etapa
 
-`dvc.yaml` declara 4 etapas, cada una atada por hash a su código y a sus
-dependencias de datos:
+| Comando | Archivos principales |
+|---|---|
+| `dataset extract-all` | `data/raw/{personas,inscripciones,servicios,registros_acceso,ventas_servicios,pagos_pendientes}.csv`, `extraction_metadata.json` |
+| `churn_dataset` | `data/processed/churn_ciclos.csv` |
+| `churn_plots` | `reports/figures/08_churn_estado_ciclo.png` … `11_churn_correlacion.png` |
+| `modeling.train` | `models/churn_model.joblib`; `data/processed/comparacion_modelos_churn.csv` (Fase 1), `metricas_tuning_ganador.csv` (Fase 2), `sensibilidad_hiperparametros_<modelo>.csv` (Fase 2), `calibracion_<modelo>.csv` + `calibracion_modelo_ganador.csv` (Fase 3); `reports/figures/07_curvas_roc.png`, `14_importancia_features.png`, `12_matriz_confusion_sin_calibrar.png`, `13_matriz_confusion_calibrada.png`, `14_calibracion.png`, y sus equivalentes sufijados por modelo (`15_calibracion_<modelo>.png`, `16_17_matriz_confusion_*_<modelo>.png`) |
+| `modeling.predict` | `data/processed/predicciones_churn.csv` |
 
-- **`churn_dataset`**: `churn_dataset.py` + los 6 CSV crudos → `churn_ciclos.csv`.
-- **`churn_eda`**: `churn_plots.py` + `churn_ciclos.csv` → figuras `08`-`11`.
-- **`train_churn_model`**: `train.py` + `churn_ciclos.csv` → `churn_model.joblib`,
-  comparación de modelos, curva ROC, matriz de confusión, importancia de
-  features.
-- **`score_churn`**: `predict.py` + `churn_ciclos.csv` + el modelo entrenado →
-  `predicciones_churn.csv`.
+## Tests
 
-```powershell
-dvc repro
+```bash
+python -m pytest tests
+# o: make test
 ```
 
-Regenera solo lo que cambió (o todo, la primera vez) y actualiza `dvc.lock`.
-Después, para versionar:
+Cubren la capa de acceso a datos, la construcción del dataset de churn, las
+figuras de EDA, y el pipeline de entrenamiento/predicción (incluyendo
+`WalkForwardGroupSplitter`, el tuning, la calibración y el filtro de ventana
+de `predict.py`). El entrenamiento real de la red neuronal hace que la
+suite tarde más de un minuto.
 
-```powershell
-git add dvc.yaml dvc.lock data/processed/.gitignore reports/figures/.gitignore models/.gitignore
-git commit -m "churn: pipeline completo"
-dvc push   # requiere tener un remote configurado (ver mas arriba)
-```
-
-Los datos crudos (`data/raw/*.csv`) siguen versionados aparte con `dvc add`,
-y el pipeline los referencia como dependencias de solo lectura.
-
-### Por qué MLflow va a `.gitignore` y no a DVC
-
-`mlflow.db` (metadata de runs), `mlruns/` (artefactos de cada modelo
-logueado, ~43 MB y creciendo) y `mlartifacts/` quedan en `.gitignore`, no
-versionados con DVC. Es una decisión deliberada, no un descuido:
-
-- **No son una función pura de los inputs.** Cada corrida de
-  `train_churn_model` crea un `run_id` nuevo con timestamp propio, incluso
-  si los datos y el código no cambiaron. El modelo de reproducibilidad de
-  DVC asume que las mismas dependencias producen las mismas salidas
-  (por eso puede cachear); la carpeta de MLflow viola eso por diseño, crece
-  con cada corrida en vez de estabilizarse.
-- **Ya están versionados, solo que por otra herramienta.** Para eso existe
-  MLflow: es su propio sistema de tracking de experimentos. Pedirle a DVC
-  que además versione la base de datos de tracking de MLflow es duplicar
-  responsabilidades sin ganar nada.
-- **El artefacto que de verdad importa ya está en DVC.** El modelo ganador
-  se guarda aparte, de forma determinística, en
-  `models/churn_model.joblib` (salida de la etapa `train_churn_model` en
-  `dvc.yaml`). Eso sí es reproducible y sí vale la pena versionar.
-
-Si en algún momento se quiere compartir el historial de experimentos entre
-el equipo, la solución correcta no es forzarlo dentro de DVC sino apuntar
-`MLFLOW_TRACKING_URI` a un tracking server remoto (o a un backend
-compartido), que es exactamente para lo que existe esa opción de
-configuración.
-
-## Project Organization
+## Estructura del proyecto
 
 ```
-├── LICENSE            <- Open-source license if one is chosen
-├── Makefile           <- Makefile with convenience commands
-├── README.md          <- The top-level README for developers using this project.
+├── Makefile                 <- Atajos: make requirements / test / lint / format / churn-pipeline
+├── README.md                <- Este archivo
+├── MONOGRAFIA.md             <- Documento metodológico completo del proyecto
+├── dvc.yaml / dvc.lock       <- Pipeline versionado (dataset -> EDA -> train -> score)
+├── mlflow.db, mlruns/         <- Tracking de experimentos de MLflow (no versionado con DVC)
 ├── data
-│   ├── external       <- Data from third party sources.
-│   ├── interim        <- Intermediate data that has been transformed.
-│   ├── processed      <- The final, canonical data sets for modeling.
-│   └── raw            <- The original, immutable data dump.
-│
-├── docs               <- A default mkdocs project; see www.mkdocs.org for details
-│
-├── models             <- Trained and serialized models (churn_model.joblib)
-│
-├── notebooks          <- Jupyter notebooks. Naming convention is a number (for ordering),
-│                         the creator's initials, and a short `-` delimited description, e.g.
-│                         `1.0-jqp-initial-data-exploration`.
-│
-├── pyproject.toml     <- Project configuration file with package metadata for 
-│                         churn_detection and configuration for tools like black
-│
-├── references         <- Data dictionaries, manuals, and all other explanatory materials.
-│
-├── reports            <- Generated analysis as HTML, PDF, LaTeX, etc.
-│   └── figures        <- Generated graphics and figures to be used in reporting
-│
-├── requirements.txt   <- The requirements file for reproducing the analysis environment, e.g.
-│                         generated with `pip freeze > requirements.txt`
-│
-├── setup.cfg          <- Configuration file for flake8
-│
-└── churn_detection   <- Source code for use in this project.
-    │
-    ├── __init__.py             <- Makes churn_detection a Python module
-    │
-    ├── config.py               <- Paths + DatabaseSettings/ChurnSettings (pydantic-settings) +
-    │                              EXCLUDED_PERSONA_IDS + RELIABLE_ACCESS_TRACKING_SINCE + MLflow config
-    │
-    ├── data                    <- DB access layer (SOLID: interface + Postgres impl)
-    │   ├── __init__.py
-    │   ├── connection.py       <- PostgresConnectionSettings + DatabaseConnectionFactory
-    │   ├── queries.py          <- Raw SQL, isolated from Python control flow
-    │   └── repository.py       <- ClientDataRepository (ABC) + PostgresClientDataRepository
-    │
-    ├── dataset.py              <- CLI (typer) to extract raw tables into data/raw/*.csv
-    │
-    ├── membership_utils.py     <- Shared: flag_membership_services (día-pass vs. membresía)
-    │
-    ├── churn_dataset.py        <- ChurnCycleDatasetBuilder: builds data/processed/churn_ciclos.csv
-    │                              (una fila por ciclo de membresía, sin fuga de datos)
-    │
-    ├── churn_plots.py          <- ChurnEDAFigureGenerator: builds reports/figures/08-11_churn_*.png
-    │
-    └── modeling                
-        ├── __init__.py 
-        ├── predict.py          <- Scores open ("censurado") cycles -> predicciones_churn.csv
-        └── train.py            <- Trains + compares churn models (MLflow-tracked) -> churn_model.joblib
+│   ├── raw                  <- CSVs extraídos de la base de datos (versionados con `dvc add`)
+│   └── processed            <- churn_ciclos.csv, comparaciones, calibraciones, predicciones
+├── models                   <- churn_model.joblib (modelo final, calibrado)
+├── reports/figures          <- Figuras de EDA, ROC, calibración, matrices de confusión
+├── tests                    <- pytest
+└── churn_detection           <- Código fuente
+    ├── config.py             <- Settings (pydantic-settings), EXCLUDED_PERSONA_IDS,
+    │                            RELIABLE_ACCESS_TRACKING_SINCE, config de MLflow
+    ├── data/                 <- Acceso a la base de datos (interfaz + implementación Postgres)
+    ├── dataset.py            <- CLI: extrae las tablas crudas a data/raw/*.csv
+    ├── membership_utils.py   <- Utilidad compartida (día-pass vs. membresía)
+    ├── churn_dataset.py      <- Construye data/processed/churn_ciclos.csv
+    ├── churn_plots.py        <- Genera las figuras de EDA
+    └── modeling
+        ├── train.py          <- Entrena, tunea, calibra y selecciona el modelo final
+        └── predict.py        <- Puntúa ciclos abiertos dentro de una ventana de fechas
 ```
 
 ## Stack
 
 POO + SOLID + PEP8, `pytest` para tests, `dvc` para versionado de datos y
 pipeline, `MLflow` para tracking de experimentos, `scikit-learn` y
-`TensorFlow`/`Keras` para los modelos. `FastAPI` para servir el modelo y
-`Docker` para contenerizar todavía no están implementados — quedan como
-siguiente fase.
+`TensorFlow`/`Keras` para los modelos. Servir el modelo por API y
+contenerizarlo todavía no están implementados — quedan como siguiente fase.
 
 --------
